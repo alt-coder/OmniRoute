@@ -20,6 +20,23 @@ function toNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function unwrapOpenAIStyleResponse(value: unknown): JsonRecord {
+  const root = toRecord(value);
+  if (Array.isArray(root.choices) || root.object === "chat.completion") {
+    return root;
+  }
+
+  const envelopeCandidates = [root.response, root.data, root.result];
+  for (const candidate of envelopeCandidates) {
+    const candidateObj = toRecord(candidate);
+    if (Array.isArray(candidateObj.choices) || candidateObj.object === "chat.completion") {
+      return candidateObj;
+    }
+  }
+
+  return root;
+}
+
 function extractMessageOutputText(item: JsonRecord): string {
   if (!Array.isArray(item.content)) return "";
   let text = "";
@@ -391,7 +408,7 @@ export function translateNonStreamingResponse(
 
   // Phase 3: Translate from OpenAI back to Client Source format
   if (sourceFormat === FORMATS.CLAUDE && sourceFormat !== targetFormat) {
-    return convertOpenAINonStreamingToClaude(toRecord(intermediateOpenAI));
+    return convertOpenAINonStreamingToClaude(unwrapOpenAIStyleResponse(intermediateOpenAI));
   }
 
   // Return intermediateOpenAI (which is either the raw response if unknown targetFormat, or an OpenAI compatible payload)
@@ -402,9 +419,11 @@ export function translateNonStreamingResponse(
  * Helper to convert an OpenAI chat.completion JSON object to Claude format for non-streaming.
  */
 function convertOpenAINonStreamingToClaude(openaiResponse: JsonRecord): JsonRecord {
-  const choices = openaiResponse.choices as unknown[] | undefined;
+  const normalizedResponse = unwrapOpenAIStyleResponse(openaiResponse);
+  const choices = normalizedResponse.choices as unknown[] | undefined;
   const isChoicesArray = Array.isArray(choices);
-  if (!isChoicesArray && openaiResponse.object !== "chat.completion") {
+
+  if (!isChoicesArray && normalizedResponse.object !== "chat.completion") {
     return openaiResponse; // If it doesn't look like OpenAI, return as-is
   }
 
@@ -459,12 +478,12 @@ function convertOpenAINonStreamingToClaude(openaiResponse: JsonRecord): JsonReco
   if (stopReason === "stop") stopReason = "end_turn";
   if (stopReason === "tool_calls") stopReason = "tool_use";
 
-  const usageSrc = toRecord(openaiResponse.usage);
+  const usageSrc = toRecord(normalizedResponse.usage);
   const claudeResponse: JsonRecord = {
-    id: toString(openaiResponse.id, `msg_${Date.now()}`),
+    id: toString(normalizedResponse.id, `msg_${Date.now()}`),
     type: "message",
     role: "assistant",
-    model: toString(openaiResponse.model, "claude"),
+    model: toString(normalizedResponse.model, "claude"),
     content,
     stop_reason: stopReason,
     stop_sequence: null,
