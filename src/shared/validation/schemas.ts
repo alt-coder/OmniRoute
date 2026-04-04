@@ -32,12 +32,23 @@ export const createProviderSchema = z.object({
     .superRefine((data, ctx) => {
       if (!data) return;
       const baseUrl = data.baseUrl;
-      if (baseUrl === undefined) return;
-      if (typeof baseUrl !== "string" || !isHttpUrl(baseUrl)) {
+      if (baseUrl !== undefined && (typeof baseUrl !== "string" || !isHttpUrl(baseUrl))) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: "providerSpecificData.baseUrl must be a valid http(s) URL",
           path: ["baseUrl"],
+        });
+      }
+      const customUserAgent = data.customUserAgent;
+      if (
+        customUserAgent !== undefined &&
+        customUserAgent !== null &&
+        (typeof customUserAgent !== "string" || customUserAgent.length > 500)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "providerSpecificData.customUserAgent must be a string up to 500 chars",
+          path: ["customUserAgent"],
         });
       }
     }),
@@ -82,7 +93,21 @@ const comboStrategySchema = z.enum([
   "fill-first",
   // #729 schema fixes for combo edit/save
   "p2c",
+  "auto",
+  "lkgp",
 ]);
+
+const scoringWeightsSchema = z
+  .object({
+    quota: z.number().min(0).max(1),
+    health: z.number().min(0).max(1),
+    costInv: z.number().min(0).max(1),
+    latencyInv: z.number().min(0).max(1),
+    taskFit: z.number().min(0).max(1),
+    stability: z.number().min(0).max(1),
+    tierPriority: z.number().min(0).max(1).optional().default(0.05),
+  })
+  .optional();
 
 const comboRuntimeConfigSchema = z
   .object({
@@ -96,6 +121,13 @@ const comboRuntimeConfigSchema = z
     healthCheckTimeoutMs: z.coerce.number().int().min(100).max(30000).optional(),
     maxComboDepth: z.coerce.number().int().min(1).max(10).optional(),
     trackMetrics: z.boolean().optional(),
+    // Auto-Combo / LKGP Extensions
+    candidatePool: z.array(z.string().min(1)).optional(),
+    weights: scoringWeightsSchema.optional(),
+    modePack: z.string().max(100).optional(),
+    budgetCap: z.number().positive().optional(),
+    explorationRate: z.number().min(0).max(1).optional(),
+    routerStrategy: z.string().optional(),
   })
   .strict();
 
@@ -116,18 +148,6 @@ export const createComboSchema = z.object({
 });
 
 // ──── Auto-Combo Schemas ────
-
-const scoringWeightsSchema = z
-  .object({
-    quota: z.number().min(0).max(1),
-    health: z.number().min(0).max(1),
-    costInv: z.number().min(0).max(1),
-    latencyInv: z.number().min(0).max(1),
-    taskFit: z.number().min(0).max(1),
-    stability: z.number().min(0).max(1),
-    tierPriority: z.number().min(0).max(1).optional().default(0.05),
-  })
-  .optional();
 
 export const createAutoComboSchema = z.object({
   id: z.string().trim().min(1, "id is required").max(100),
@@ -1024,12 +1044,23 @@ export const updateProviderConnectionSchema = z
       .superRefine((data, ctx) => {
         if (!data) return;
         const baseUrl = data.baseUrl;
-        if (baseUrl === undefined) return;
-        if (typeof baseUrl !== "string" || !isHttpUrl(baseUrl)) {
+        if (baseUrl !== undefined && (typeof baseUrl !== "string" || !isHttpUrl(baseUrl))) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             message: "providerSpecificData.baseUrl must be a valid http(s) URL",
             path: ["baseUrl"],
+          });
+        }
+        const customUserAgent = data.customUserAgent;
+        if (
+          customUserAgent !== undefined &&
+          customUserAgent !== null &&
+          (typeof customUserAgent !== "string" || customUserAgent.length > 500)
+        ) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "providerSpecificData.customUserAgent must be a string up to 500 chars",
+            path: ["customUserAgent"],
           });
         }
       }),
@@ -1066,6 +1097,7 @@ export const validateProviderApiKeySchema = z.object({
   provider: z.string().trim().min(1, "Provider and API key required"),
   apiKey: z.string().trim().min(1, "Provider and API key required"),
   validationModelId: z.string().trim().optional(),
+  customUserAgent: z.string().trim().max(500).optional(),
 });
 
 const geminiPartSchema = z

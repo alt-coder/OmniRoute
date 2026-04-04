@@ -100,6 +100,11 @@ import { normalizePayloadForLog } from "@/lib/logPayloads";
 import { injectMemory, shouldInjectMemory } from "@/lib/memory/injection";
 import { retrieveMemories } from "@/lib/memory/retrieval";
 import {
+  DEFAULT_MEMORY_SETTINGS,
+  getMemorySettings,
+  toMemoryRetrievalConfig,
+} from "@/lib/memory/settings";
+import {
   buildClaudeCodeCompatibleRequest,
   isClaudeCodeCompatibleProvider,
   resolveClaudeCodeCompatibleSessionId,
@@ -627,18 +632,36 @@ export async function handleChatCore({
   // Primary path: merge client model id + alias target so config on either key applies; resolved
   // id wins on same header name. T5 family fallback uses only (nextModel, resolveModelAlias(next))
   // so A-model headers are not sent to B — see buildUpstreamHeadersForExecute.
+  const connectionCustomUserAgent =
+    credentials?.providerSpecificData &&
+    typeof credentials.providerSpecificData === "object" &&
+    typeof credentials.providerSpecificData.customUserAgent === "string"
+      ? credentials.providerSpecificData.customUserAgent.trim()
+      : "";
+
   const buildUpstreamHeadersForExecute = (modelToCall: string): Record<string, string> => {
-    if (modelToCall === effectiveModel) {
-      return {
-        ...getModelUpstreamExtraHeaders(provider || "", model || "", sourceFormat),
-        ...getModelUpstreamExtraHeaders(provider || "", resolvedModel || "", sourceFormat),
-      };
+    const upstreamHeaders =
+      modelToCall === effectiveModel
+        ? {
+            ...getModelUpstreamExtraHeaders(provider || "", model || "", sourceFormat),
+            ...getModelUpstreamExtraHeaders(provider || "", resolvedModel || "", sourceFormat),
+          }
+        : (() => {
+            const r = resolveModelAlias(modelToCall);
+            return {
+              ...getModelUpstreamExtraHeaders(provider || "", modelToCall || "", sourceFormat),
+              ...getModelUpstreamExtraHeaders(provider || "", r || "", sourceFormat),
+            };
+          })();
+
+    if (connectionCustomUserAgent) {
+      upstreamHeaders["User-Agent"] = connectionCustomUserAgent;
+      if ("user-agent" in upstreamHeaders) {
+        upstreamHeaders["user-agent"] = connectionCustomUserAgent;
+      }
     }
-    const r = resolveModelAlias(modelToCall);
-    return {
-      ...getModelUpstreamExtraHeaders(provider || "", modelToCall || "", sourceFormat),
-      ...getModelUpstreamExtraHeaders(provider || "", r || "", sourceFormat),
-    };
+
+    return upstreamHeaders;
   };
 
   // Default to false unless client explicitly sets stream: true (OpenAI spec compliant)
@@ -714,9 +737,22 @@ export async function handleChatCore({
     });
   }
 
-  if (apiKeyInfo?.id && shouldInjectMemory(body as Parameters<typeof shouldInjectMemory>[0])) {
+  const memorySettings = apiKeyInfo?.id
+    ? await getMemorySettings().catch(() => DEFAULT_MEMORY_SETTINGS)
+    : null;
+
+  if (
+    apiKeyInfo?.id &&
+    memorySettings &&
+    shouldInjectMemory(body as Parameters<typeof shouldInjectMemory>[0], {
+      enabled: memorySettings.enabled && memorySettings.maxTokens > 0,
+    })
+  ) {
     try {
-      const memories = await retrieveMemories(apiKeyInfo.id);
+      const memories = await retrieveMemories(
+        apiKeyInfo.id,
+        toMemoryRetrievalConfig(memorySettings)
+      );
       if (memories.length > 0) {
         const injected = injectMemory(
           body as Parameters<typeof injectMemory>[0],
