@@ -15,13 +15,15 @@ export interface Settings {
     | "cost-optimized"
     | "strict-random";
   stickyRoundRobinLimit: number;
+  requestRetry: number;
+  maxRetryIntervalSec: number;
   jwtSecret?: string;
   hideHealthCheckLogs?: boolean;
   hiddenSidebarItems?: HideableSidebarItemId[];
 }
 
 export interface ComboDefaults {
-  strategy: "priority" | "weighted" | "round-robin";
+  strategy: "priority" | "weighted" | "round-robin" | "context-relay";
   maxRetries: number;
   retryDelayMs: number;
   timeoutMs: number;
@@ -31,6 +33,10 @@ export interface ComboDefaults {
   trackMetrics: boolean;
   concurrencyPerModel?: number;
   queueTimeoutMs?: number;
+  handoffThreshold?: number;
+  handoffModel?: string;
+  handoffProviders?: string[];
+  maxMessagesForSummary?: number;
 }
 
 export interface ProxyConfig {

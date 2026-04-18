@@ -1,11 +1,15 @@
 import { NextResponse } from "next/server";
+import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
+import {
+  getProviderAuditTarget,
+  summarizeProviderConnectionForAudit,
+} from "@/lib/compliance/providerAudit";
 import {
   getProviderConnections,
   createProviderConnection,
   getProviderNodeById,
   isCloudEnabled,
 } from "@/models";
-import { APIKEY_PROVIDERS } from "@/shared/constants/config";
 import {
   isClaudeCodeCompatibleProvider,
   isOpenAICompatibleProvider,
@@ -15,10 +19,16 @@ import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { createProviderSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { normalizeQoderPatProviderData } from "@omniroute/open-sse/services/qoderCli.ts";
+import { normalizeQoderPatProviderData } from "@omniroute/open-sse/services/qoderCli";
+import { normalizeProviderSpecificData } from "@/lib/providers/requestDefaults";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { isManagedProviderConnectionId } from "@/lib/providers/catalog";
 
 // GET /api/providers - List all connections
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   try {
     const connections = await getProviderConnections();
 
@@ -29,6 +39,12 @@ export async function GET() {
       accessToken: undefined,
       refreshToken: undefined,
       idToken: undefined,
+      providerSpecificData: c.providerSpecificData
+        ? {
+            ...c.providerSpecificData,
+            consoleApiKey: undefined,
+          }
+        : undefined,
     }));
 
     return NextResponse.json({ connections: safeConnections });
@@ -40,6 +56,11 @@ export async function GET() {
 
 // POST /api/providers - Create new connection (API Key only, OAuth via separate flow)
 export async function POST(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
+  const auditContext = getAuditRequestContext(request);
+
   try {
     const body = await request.json();
 
@@ -61,8 +82,7 @@ export async function POST(request: Request) {
 
     // Business validation
     const isValidProvider =
-      APIKEY_PROVIDERS[provider] ||
-      provider === "qoder" ||
+      isManagedProviderConnectionId(provider) ||
       isOpenAICompatibleProvider(provider) ||
       isAnthropicCompatibleProvider(provider);
 
@@ -132,6 +152,8 @@ export async function POST(request: Request) {
       };
     }
 
+    providerSpecificData = normalizeProviderSpecificData(provider, providerSpecificData) || null;
+
     const newConnection = await createProviderConnection({
       provider,
       authType: "apikey",
@@ -150,9 +172,26 @@ export async function POST(request: Request) {
     // Hide sensitive fields
     const result: Record<string, any> = { ...newConnection };
     delete result.apiKey;
+    if (result.providerSpecificData) {
+      delete result.providerSpecificData.consoleApiKey;
+    }
 
     // Auto sync to Cloud if enabled
     await syncToCloudIfEnabled();
+
+    logAuditEvent({
+      action: "provider.credentials.created",
+      actor: "admin",
+      target: getProviderAuditTarget(newConnection),
+      resourceType: "provider_credentials",
+      status: "success",
+      ipAddress: auditContext.ipAddress || undefined,
+      requestId: auditContext.requestId,
+      metadata: {
+        provider: provider,
+        connection: summarizeProviderConnectionForAudit(newConnection),
+      },
+    });
 
     return NextResponse.json({ connection: result }, { status: 201 });
   } catch (error) {

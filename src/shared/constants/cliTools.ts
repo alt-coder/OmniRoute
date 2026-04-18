@@ -270,6 +270,51 @@ export const CLI_TOOLS = {
 }`,
     },
   },
+  amp: {
+    id: "amp",
+    name: "Amp CLI",
+    icon: "terminal",
+    color: "#F97316",
+    description: "Sourcegraph Amp coding assistant CLI",
+    docsUrl: "/docs?section=cli-tools&tool=amp",
+    configType: "guide",
+    defaultCommand: "amp",
+    modelAliases: ["g25p", "g25f", "cs45", "g54"],
+    notes: [
+      {
+        type: "info",
+        text: "Use OmniRoute model aliases to keep Amp shorthand mappings stable across provider updates.",
+      },
+      {
+        type: "warning",
+        text: "Suggested shorthand examples: g25p → gemini/gemini-2.5-pro, g25f → gemini/gemini-2.5-flash, cs45 → cc/claude-sonnet-4-5-20250929.",
+      },
+    ],
+    guideSteps: [
+      {
+        step: 1,
+        title: "Install Amp",
+        desc: "Install the Amp CLI using the package manager supported by your environment.",
+      },
+      { step: 2, title: "API Key", type: "apiKeySelector" },
+      { step: 3, title: "Base URL", value: "{{baseUrl}}", copyable: true },
+      { step: 4, title: "Select Model", type: "modelSelector" },
+      {
+        step: 5,
+        title: "Add Shorthands",
+        desc: "Map Amp shorthand names such as g25p or cs45 to OmniRoute aliases in your local config.",
+      },
+    ],
+    codeBlock: {
+      language: "bash",
+      code: `export OPENAI_API_KEY="{{apiKey}}"
+export OPENAI_BASE_URL="{{baseUrl}}"
+amp --model "{{model}}"
+# Example shorthand aliases you can map locally:
+# g25p -> gemini/gemini-2.5-pro
+# cs45 -> cc/claude-sonnet-4-5-20250929`,
+    },
+  },
   kiro: {
     id: "kiro",
     name: "Kiro AI",
@@ -285,6 +330,48 @@ export const CLI_TOOLS = {
       { step: 3, title: "API Key", type: "apiKeySelector" },
       { step: 4, title: "Select Model", type: "modelSelector" },
     ],
+  },
+  qwen: {
+    id: "qwen",
+    name: "Qwen Code",
+    icon: "psychology",
+    color: "#10B981",
+    description: "Alibaba Qwen Code CLI — OpenAI-compatible endpoint",
+    docsUrl: "https://qwenlm.github.io/qwen-code-docs/",
+    configType: "custom",
+    defaultCommand: "qwen",
+    notes: [
+      {
+        type: "info",
+        text: "Qwen Code supports custom OpenAI-compatible API endpoints via environment variables or settings.json.",
+      },
+      {
+        type: "warning",
+        text: "Config path: Linux/macOS ~/.qwen/ • Windows %USERPROFILE%\\.qwen\\",
+      },
+    ],
+    guideSteps: [
+      { step: 1, title: "Install Qwen Code", desc: "npm install -g @qwen-code/qwen-code" },
+      { step: 2, title: "API Key", type: "apiKeySelector" },
+      { step: 3, title: "Base URL", value: "{{baseUrl}}", copyable: true },
+      {
+        step: 4,
+        title: "Configure Settings",
+        desc: "Add to your ~/.qwen/.env file or settings.json env field:",
+      },
+    ],
+    codeBlock: {
+      language: "bash",
+      code: `# ~/.qwen/.env
+OPENAI_API_KEY="{{apiKey}}"
+OPENAI_BASE_URL="{{baseUrl}}"
+OPENAI_MODEL="auto"
+# Or add to settings.json:
+# "env": {
+#   "OPENAI_API_KEY": "{{apiKey}}",
+#   "OPENAI_BASE_URL": "{{baseUrl}}"
+# }`,
+    },
   },
   // HIDDEN: gemini-cli
   // "gemini-cli": {

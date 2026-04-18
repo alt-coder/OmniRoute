@@ -8,10 +8,50 @@ export function geminiToOpenAIResponse(chunk, state) {
 
   // Handle Antigravity wrapper
   const response = chunk.response || chunk;
-  if (!response || !response.candidates?.[0]) return null;
+  if (!response) return null;
 
   const results = [];
-  const candidate = response.candidates[0];
+  const candidate = response.candidates?.[0];
+
+  if (!candidate) {
+    const promptFeedback = response.promptFeedback || chunk.promptFeedback;
+    if (!promptFeedback) return null;
+
+    if (!state.messageId) {
+      state.messageId = response.responseId || `msg_${Date.now()}`;
+      state.model = response.modelVersion || "gemini";
+      results.push({
+        id: `chatcmpl-${state.messageId}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: state.model,
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant", content: "" },
+            finish_reason: null,
+          },
+        ],
+      });
+    }
+
+    results.push({
+      id: `chatcmpl-${state.messageId}`,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: "content_filter",
+        },
+      ],
+    });
+
+    return results;
+  }
+
   const content = candidate.content;
 
   // Initialize state
@@ -43,8 +83,8 @@ export function geminiToOpenAIResponse(chunk, state) {
         state.pendingThoughtSignature = hasThoughtSig;
       }
 
-      // Handle thought signature (thinking mode)
-      if (hasThoughtSig) {
+      // Handle thought signature (thinking mode) or native gemini thought flag
+      if (hasThoughtSig || isThought) {
         const hasTextContent = part.text !== undefined && part.text !== "";
         const hasFunctionCall = !!part.functionCall;
 
@@ -65,7 +105,8 @@ export function geminiToOpenAIResponse(chunk, state) {
         }
 
         if (hasFunctionCall) {
-          const fcName = part.functionCall.name;
+          const rawToolName = part.functionCall.name;
+          const fcName = state.toolNameMap?.get(rawToolName) || rawToolName;
           const fcArgs = part.functionCall.args || {};
           const toolCallIndex = state.functionIndex++;
 
@@ -122,7 +163,8 @@ export function geminiToOpenAIResponse(chunk, state) {
 
       // Function call
       if (part.functionCall) {
-        const fcName = part.functionCall.name;
+        const rawToolName = part.functionCall.name;
+        const fcName = state.toolNameMap?.get(rawToolName) || rawToolName;
         const fcArgs = part.functionCall.args || {};
         const toolCallIndex = state.functionIndex++;
 
@@ -238,6 +280,8 @@ export function geminiToOpenAIResponse(chunk, state) {
     let finishReason = candidate.finishReason.toLowerCase();
     if (finishReason === "stop" && state.toolCalls.size > 0) {
       finishReason = "tool_calls";
+    } else if (finishReason === "max_tokens") {
+      finishReason = "length";
     }
     // Content blocked by Gemini safety filters — pass through as "content_filter"
     // so downstream clients can distinguish from normal completion.

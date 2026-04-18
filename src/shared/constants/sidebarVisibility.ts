@@ -4,11 +4,10 @@ export const HIDEABLE_SIDEBAR_ITEM_IDS = [
   "api-manager",
   "providers",
   "combos",
-  "auto-combo",
   "costs",
   "analytics",
-  "limits",
   "cache",
+  "limits",
   "cli-tools",
   "agents",
   "memory",
@@ -17,8 +16,8 @@ export const HIDEABLE_SIDEBAR_ITEM_IDS = [
   "playground",
   "media",
   "search-tools",
-  "health",
   "logs",
+  "health",
   "audit",
   "settings",
   "docs",
@@ -52,11 +51,10 @@ const PRIMARY_SIDEBAR_ITEMS: readonly SidebarItemDefinition[] = [
   { id: "api-manager", href: "/dashboard/api-manager", i18nKey: "apiManager", icon: "vpn_key" },
   { id: "providers", href: "/dashboard/providers", i18nKey: "providers", icon: "dns" },
   { id: "combos", href: "/dashboard/combos", i18nKey: "combos", icon: "layers" },
-  { id: "auto-combo", href: "/dashboard/auto-combo", i18nKey: "autoCombo", icon: "auto_awesome" },
   { id: "costs", href: "/dashboard/costs", i18nKey: "costs", icon: "account_balance_wallet" },
   { id: "analytics", href: "/dashboard/analytics", i18nKey: "analytics", icon: "analytics" },
-  { id: "limits", href: "/dashboard/limits", i18nKey: "limits", icon: "tune" },
   { id: "cache", href: "/dashboard/cache", i18nKey: "cache", icon: "cached" },
+  { id: "limits", href: "/dashboard/limits", i18nKey: "limits", icon: "tune" },
   { id: "media", href: "/dashboard/cache/media", i18nKey: "media", icon: "perm_media" },
 ];
 
@@ -79,8 +77,8 @@ const DEBUG_SIDEBAR_ITEMS: readonly SidebarItemDefinition[] = [
 ];
 
 const SYSTEM_SIDEBAR_ITEMS: readonly SidebarItemDefinition[] = [
-  { id: "health", href: "/dashboard/health", i18nKey: "health", icon: "health_and_safety" },
   { id: "logs", href: "/dashboard/logs", i18nKey: "logs", icon: "description" },
+  { id: "health", href: "/dashboard/health", i18nKey: "health", icon: "health_and_safety" },
   { id: "audit", href: "/dashboard/audit", i18nKey: "auditLog", icon: "history" },
   { id: "settings", href: "/dashboard/settings", i18nKey: "settings", icon: "settings" },
 ];

@@ -26,9 +26,17 @@ export default function SkillsPage() {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [executions, setExecutions] = useState<Execution[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<"skills" | "executions" | "sandbox" | "marketplace">(
-    "skills"
-  );
+  const [skillsPage, setSkillsPage] = useState(1);
+  const [skillsTotal, setSkillsTotal] = useState(0);
+  const [skillsTotalPages, setSkillsTotalPages] = useState(1);
+
+  const [execPage, setExecPage] = useState(1);
+  const [execTotal, setExecTotal] = useState(0);
+  const [execTotalPages, setExecTotalPages] = useState(1);
+
+  const [activeTab, setActiveTab] = useState<
+    "skills" | "executions" | "sandbox" | "marketplace" | "skillssh"
+  >("skills");
   const [showInstallModal, setShowInstallModal] = useState(false);
   const [installJson, setInstallJson] = useState("");
   const [installStatus, setInstallStatus] = useState<{
@@ -50,24 +58,51 @@ export default function SkillsPage() {
   const [mpLoading, setMpLoading] = useState(false);
   const [mpError, setMpError] = useState("");
   const [mpInstallingId, setMpInstallingId] = useState<string | null>(null);
+  const [shQuery, setShQuery] = useState("");
+  const [shResults, setShResults] = useState<
+    { id: string; skillId: string; name: string; installs: number; source: string }[]
+  >([]);
+  const [shLoading, setShLoading] = useState(false);
+  const [shError, setShError] = useState("");
+  const [shInstallingId, setShInstallingId] = useState<string | null>(null);
   const t = useTranslations("skills");
+
+  const fetchSkills = async (page: number) => {
+    const res = await fetch(`/api/skills?page=${page}&limit=20`).then((r) => r.json());
+    setSkills(res.data || []);
+    setSkillsTotal(res.total || 0);
+    setSkillsTotalPages(res.totalPages || 1);
+  };
+
+  const fetchExecutions = async (page: number) => {
+    const res = await fetch(`/api/skills/executions?page=${page}&limit=20`).then((r) => r.json());
+    setExecutions(res.data || []);
+    setExecTotal(res.total || 0);
+    setExecTotalPages(res.totalPages || 1);
+  };
 
   useEffect(() => {
     Promise.all([
-      fetch("/api/skills").then((r) => r.json()),
-      fetch("/api/skills/executions").then((r) => r.json()),
+      fetch("/api/skills?page=1&limit=20").then((r) => r.json()),
+      fetch("/api/skills/executions?page=1&limit=20").then((r) => r.json()),
     ])
       .then(([skillsData, executionsData]) => {
-        setSkills(skillsData.skills || []);
-        setExecutions(executionsData.executions || []);
+        setSkills(skillsData.data || []);
+        setSkillsTotal(skillsData.total || 0);
+        setSkillsTotalPages(skillsData.totalPages || 1);
+
+        setExecutions(executionsData.data || []);
+        setExecTotal(executionsData.total || 0);
+        setExecTotalPages(executionsData.totalPages || 1);
+
         setLoading(false);
       })
       .catch(() => setLoading(false));
   }, []);
 
   const refreshSkills = async () => {
-    const res = await fetch("/api/skills").then((r) => r.json());
-    setSkills(res.skills || []);
+    setSkillsPage(1);
+    await fetchSkills(1);
   };
 
   const toggleSkill = async (skillId: string, enabled: boolean) => {
@@ -137,7 +172,7 @@ export default function SkillsPage() {
       if (!res.ok) {
         setMpError(data.error || "Search failed");
       } else {
-        setMpResults(data.skills || []);
+        setMpResults(Array.isArray(data) ? data : data.skills || []);
       }
     } catch (err) {
       setMpError(err instanceof Error ? err.message : "Search failed");
@@ -177,6 +212,58 @@ export default function SkillsPage() {
     } catch (err) {
       setMpError(err instanceof Error ? err.message : "Install failed");
       setMpInstallingId(null);
+    }
+  };
+
+  const searchSkillsSh = async () => {
+    setShLoading(true);
+    setShError("");
+    setShResults([]);
+    try {
+      const res = await fetch(`/api/skills/skillssh?q=${encodeURIComponent(shQuery)}`);
+      const data = await res.json();
+      if (!res.ok) {
+        setShError(data.error || "Search failed");
+      } else {
+        setShResults(data.skills || []);
+      }
+    } catch (err) {
+      setShError(err instanceof Error ? err.message : "Search failed");
+    } finally {
+      setShLoading(false);
+    }
+  };
+
+  const installFromSkillsSh = async (skill: {
+    id: string;
+    skillId: string;
+    name: string;
+    installs: number;
+    source: string;
+  }) => {
+    setShInstallingId(skill.id);
+    try {
+      const res = await fetch("/api/skills/skillssh/install", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: skill.name,
+          description: `Installed from skills.sh (${skill.source})`,
+          source: skill.source,
+          skillId: skill.skillId,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        await refreshSkills();
+        setShInstallingId(null);
+      } else {
+        setShError(data.error || "Install failed");
+        setShInstallingId(null);
+      }
+    } catch (err) {
+      setShError(err instanceof Error ? err.message : "Install failed");
+      setShInstallingId(null);
     }
   };
 
@@ -244,6 +331,16 @@ export default function SkillsPage() {
         >
           Marketplace
         </button>
+        <button
+          onClick={() => setActiveTab("skillssh")}
+          className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+            activeTab === "skillssh"
+              ? "border-violet-500 text-violet-400"
+              : "border-transparent text-text-muted hover:text-text-main"
+          }`}
+        >
+          skills.sh
+        </button>
       </div>
 
       {activeTab === "skills" && (
@@ -291,6 +388,35 @@ export default function SkillsPage() {
               </Card>
             ))
           )}
+          <div className="flex items-center justify-between mt-4 pt-4 border-t border-border">
+            <span className="text-sm text-text-muted">
+              Page {skillsPage} of {skillsTotalPages} ({skillsTotal} total)
+            </span>
+            <div className="flex gap-2">
+              <button
+                onClick={() => {
+                  const p = Math.max(1, skillsPage - 1);
+                  setSkillsPage(p);
+                  fetchSkills(p);
+                }}
+                disabled={skillsPage === 1}
+                className="px-3 py-1 text-sm rounded border border-border text-text-muted hover:text-text-main disabled:opacity-40 transition-colors"
+              >
+                Prev
+              </button>
+              <button
+                onClick={() => {
+                  const p = Math.min(skillsTotalPages, skillsPage + 1);
+                  setSkillsPage(p);
+                  fetchSkills(p);
+                }}
+                disabled={skillsPage === skillsTotalPages || skillsTotalPages === 0}
+                className="px-3 py-1 text-sm rounded border border-border text-text-muted hover:text-text-main disabled:opacity-40 transition-colors"
+              >
+                Next
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -339,6 +465,35 @@ export default function SkillsPage() {
                 )}
               </tbody>
             </table>
+          </div>
+          <div className="flex items-center justify-between mt-4 pt-4 border-t border-border">
+            <span className="text-sm text-text-muted">
+              Page {execPage} of {execTotalPages} ({execTotal} total)
+            </span>
+            <div className="flex gap-2">
+              <button
+                onClick={() => {
+                  const p = Math.max(1, execPage - 1);
+                  setExecPage(p);
+                  fetchExecutions(p);
+                }}
+                disabled={execPage === 1}
+                className="px-3 py-1 text-sm rounded border border-border text-text-muted hover:text-text-main disabled:opacity-40 transition-colors"
+              >
+                Prev
+              </button>
+              <button
+                onClick={() => {
+                  const p = Math.min(execTotalPages, execPage + 1);
+                  setExecPage(p);
+                  fetchExecutions(p);
+                }}
+                disabled={execPage === execTotalPages || execTotalPages === 0}
+                className="px-3 py-1 text-sm rounded border border-border text-text-muted hover:text-text-main disabled:opacity-40 transition-colors"
+              >
+                Next
+              </button>
+            </div>
           </div>
         </Card>
       )}
@@ -433,6 +588,66 @@ export default function SkillsPage() {
             <Card>
               <div className="text-center py-8 text-text-muted">
                 Configure your SkillsMP API key in Settings to browse the marketplace.
+              </div>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {activeTab === "skillssh" && (
+        <div className="grid gap-4">
+          <Card>
+            <h3 className="font-semibold mb-4">skills.sh Directory</h3>
+            <div className="flex gap-2 mb-4">
+              <input
+                type="text"
+                value={shQuery}
+                onChange={(e) => setShQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && searchSkillsSh()}
+                placeholder="Search skills.sh..."
+                className="flex-1 px-3 py-2 rounded-lg bg-background border border-border text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+              />
+              <button
+                onClick={searchSkillsSh}
+                disabled={shLoading}
+                className="px-4 py-2 text-sm font-medium rounded-lg bg-violet-500 text-white hover:bg-violet-600 disabled:opacity-50 transition-colors"
+              >
+                {shLoading ? "Searching..." : "Search skills.sh"}
+              </button>
+            </div>
+            {shError && (
+              <div className="p-3 rounded-lg bg-red-500/10 text-red-400 text-sm mb-4">
+                {shError}
+              </div>
+            )}
+          </Card>
+          {shResults.length > 0 && (
+            <div className="grid gap-3">
+              {shResults.map((skill) => (
+                <Card key={skill.id}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h4 className="font-semibold">{skill.name}</h4>
+                      <p className="text-sm text-text-muted mt-1">
+                        {skill.source} · {skill.installs.toLocaleString()} installs
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => installFromSkillsSh(skill)}
+                      disabled={shInstallingId === skill.id}
+                      className="px-4 py-1.5 text-sm font-medium rounded-lg bg-violet-500 text-white hover:bg-violet-600 disabled:opacity-50 transition-colors"
+                    >
+                      {shInstallingId === skill.id ? "Installing..." : "Install"}
+                    </button>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+          {!shLoading && shResults.length === 0 && !shError && (
+            <Card>
+              <div className="text-center py-8 text-text-muted">
+                Search the skills.sh open directory to discover and install agent skills.
               </div>
             </Card>
           )}

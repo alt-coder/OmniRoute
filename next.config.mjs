@@ -1,9 +1,11 @@
 import createNextIntlPlugin from "next-intl/plugin";
 
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
+const distDir = process.env.NEXT_DIST_DIR || ".next";
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  distDir,
   // Turbopack config: redirect native modules to stubs at build time
   turbopack: {
     resolveAlias: {
@@ -12,6 +14,22 @@ const nextConfig = {
     },
   },
   output: "standalone",
+  outputFileTracingExcludes: {
+    // Planning/task docs are not runtime assets and can break standalone copies
+    // when broad fs/path tracing pulls the whole repository into the NFT graph.
+    "/*": [
+      "./.git/**/*",
+      "./_tasks/**/*",
+      "./_references/**/*",
+      "./_ideia/**/*",
+      "./_mono_repo/**/*",
+      "./coverage/**/*",
+      "./test-results/**/*",
+      "./playwright-report/**/*",
+      "./app.__qa_backup/**/*",
+      "./tests/**/*",
+    ],
+  },
   serverExternalPackages: [
     "pino",
     "pino-pretty",
@@ -65,10 +83,10 @@ const nextConfig = {
       //
       // We use two strategies:
       //  1. Exact-name externals for all known server-side packages.
-      //  2. Hash-strip catch-all: any require('<name>-<16hexchars>' strips the
-      //     suffix and falls through to the real package name.
+      //  2. Hash-strip catch-all: any require('<name>-<16hexchars>[/subpath]')
+      //     strips the hash suffix and falls through to the real package name.
       //
-      const HASH_PATTERN = /^(.+)-[0-9a-f]{16}$/;
+      const HASH_PATTERN = /^(.+)-[0-9a-f]{16}(\/.*)?$/;
 
       const KNOWN_EXTERNALS = new Set([
         "better-sqlite3",
@@ -100,13 +118,15 @@ const nextConfig = {
           if (KNOWN_EXTERNALS.has(request)) {
             return callback(null, `commonjs ${request}`);
           }
-          // Case 2: Hash-suffixed name — strip hash, use base name
+          // Case 2: Hash-suffixed name — strip hash, preserve subpath
           // e.g. "better-sqlite3-90e2652d1716b047" → "better-sqlite3"
           //      "zod-dcb22c6336e0bc69"            → "zod"
+          //      "zod-dcb22c6336e0bc69/v3"         → "zod/v3"
+          //      "zod-dcb22c6336e0bc69/v4-mini"    → "zod/v4-mini"
           const hashMatch = request?.match?.(HASH_PATTERN);
           if (hashMatch) {
-            const baseName = hashMatch[1];
-            return callback(null, `commonjs ${baseName}`);
+            const resolved = hashMatch[2] ? `${hashMatch[1]}${hashMatch[2]}` : hashMatch[1];
+            return callback(null, `commonjs ${resolved}`);
           }
           callback();
         },

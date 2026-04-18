@@ -1,6 +1,7 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 import { CLAUDE_SYSTEM_PROMPT } from "../../config/constants.ts";
+import { supportsXHighEffort } from "../../config/providerModels.ts";
 import { adjustMaxTokens } from "../helpers/maxTokensHelper.ts";
 import { sanitizeToolId } from "../helpers/schemaCoercion.ts";
 import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../../config/defaultThinkingSignature.ts";
@@ -99,6 +100,7 @@ export function openaiToClaudeRequest(model, body, stream) {
     tools?: ClaudeTool[];
     tool_choice?: Record<string, unknown> | string;
     thinking?: Record<string, unknown>;
+    output_config?: Record<string, unknown>;
     _toolNameMap?: Map<string, string>;
   } = {
     model: model,
@@ -110,6 +112,12 @@ export function openaiToClaudeRequest(model, body, stream) {
   // Temperature
   if (body.temperature !== undefined) {
     result.temperature = body.temperature;
+  }
+  if (body.top_p !== undefined) {
+    result.top_p = body.top_p;
+  }
+  if (body.stop !== undefined) {
+    result.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
   }
 
   // Messages
@@ -232,49 +240,42 @@ export function openaiToClaudeRequest(model, body, stream) {
     }
   }
 
-  // System with Claude Code prompt and cache_control
-  const claudeCodePrompt = { type: "text", text: CLAUDE_SYSTEM_PROMPT };
-
-  if (systemParts.length > 0) {
-    const systemText = systemParts.join("\n");
-    result.system = [
-      claudeCodePrompt,
-      { type: "text", text: systemText, cache_control: { type: "ephemeral", ttl: "1h" } },
-    ];
-  } else {
-    result.system = [claudeCodePrompt];
-  }
-
   // Tools - convert from OpenAI format to Claude format with prefix for OAuth
   if (body.tools && Array.isArray(body.tools)) {
-    result.tools = body.tools.map((tool) => {
-      const toolData = tool.type === "function" && tool.function ? tool.function : tool;
-      const originalName = toolData.name;
+    result.tools = body.tools
+      .map((tool) => {
+        const toolData = tool.type === "function" && tool.function ? tool.function : tool;
+        const originalName = typeof toolData.name === "string" ? toolData.name.trim() : "";
 
-      // Claude OAuth requires prefixed tool names to avoid conflicts
-      // When prefix is disabled (non-Claude backends), use original name
-      const toolName = disableToolPrefix ? originalName : CLAUDE_OAUTH_TOOL_PREFIX + originalName;
+        if (!originalName) {
+          return null;
+        }
 
-      // Store mapping for response translation (prefixed → original)
-      if (!disableToolPrefix) {
-        toolNameMap.set(toolName, originalName);
-      }
+        // Claude OAuth requires prefixed tool names to avoid conflicts
+        // When prefix is disabled (non-Claude backends), use original name
+        const toolName = disableToolPrefix ? originalName : CLAUDE_OAUTH_TOOL_PREFIX + originalName;
 
-      // Normalize input_schema: Anthropic requires `properties` when type is "object" (#595).
-      // MCP tools (e.g. pencil, computer_use) may omit properties on object-type schemas.
-      const rawSchema: Record<string, unknown> = toolData.parameters ||
-        toolData.input_schema || { type: "object", properties: {}, required: [] };
-      const normalizedSchema =
-        rawSchema.type === "object" && !rawSchema.properties
-          ? { ...rawSchema, properties: {} }
-          : rawSchema;
+        // Store mapping for response translation (prefixed → original)
+        if (!disableToolPrefix) {
+          toolNameMap.set(toolName, originalName);
+        }
 
-      return {
-        name: toolName,
-        description: toolData.description || "",
-        input_schema: normalizedSchema,
-      };
-    });
+        // Normalize input_schema: Anthropic requires `properties` when type is "object" (#595).
+        // MCP tools (e.g. pencil, computer_use) may omit properties on object-type schemas.
+        const rawSchema: Record<string, unknown> = toolData.parameters ||
+          toolData.input_schema || { type: "object", properties: {}, required: [] };
+        const normalizedSchema =
+          rawSchema.type === "object" && !rawSchema.properties
+            ? { ...rawSchema, properties: {} }
+            : rawSchema;
+
+        return {
+          name: toolName,
+          description: toolData.description || "",
+          input_schema: normalizedSchema,
+        };
+      })
+      .filter((tool): tool is ClaudeTool => Boolean(tool));
 
     // Filter out tools with empty names (would cause Claude 400 error)
     result.tools = result.tools.filter((tool) => tool.name && tool.name?.trim());
@@ -311,6 +312,19 @@ export function openaiToClaudeRequest(model, body, stream) {
     }
   }
 
+  // System with Claude Code prompt and cache_control
+  const claudeCodePrompt = { type: "text", text: CLAUDE_SYSTEM_PROMPT };
+
+  if (systemParts.length > 0) {
+    const systemText = systemParts.join("\n");
+    result.system = [
+      claudeCodePrompt,
+      { type: "text", text: systemText, cache_control: { type: "ephemeral", ttl: "1h" } },
+    ];
+  } else {
+    result.system = [claudeCodePrompt];
+  }
+
   // Thinking configuration
   if (body.thinking) {
     result.thinking = {
@@ -321,22 +335,36 @@ export function openaiToClaudeRequest(model, body, stream) {
   } else if (body.reasoning_effort) {
     // Convert OpenAI reasoning_effort to Claude thinking format (#627)
     // Clients like OpenCode send reasoning_effort via @ai-sdk/openai-compatible
-    const effortBudgetMap: Record<string, number> = {
-      low: 1024,
-      medium: 10240,
-      high: 131072,
-      max: 131072,
-    };
-    const effort = String(body.reasoning_effort).toLowerCase();
-    const budget = effortBudgetMap[effort];
-    if (budget !== undefined && budget > 0) {
+    const requestedEffort = String(body.reasoning_effort).toLowerCase();
+    const normalizedEffort =
+      requestedEffort === "xhigh" && !supportsXHighEffort("claude", model)
+        ? "high"
+        : requestedEffort;
+    if (normalizedEffort === "xhigh") {
       result.thinking = {
-        type: "enabled",
-        budget_tokens: budget,
+        type: "adaptive",
       };
-      // Claude requires max_tokens > budget_tokens
-      if (result.max_tokens <= budget) {
-        result.max_tokens = budget + 8192;
+      result.output_config = {
+        ...(result.output_config || {}),
+        effort: "xhigh",
+      };
+    } else {
+      const effortBudgetMap: Record<string, number> = {
+        low: 1024,
+        medium: 10240,
+        high: 131072,
+        max: 131072,
+      };
+      const budget = effortBudgetMap[normalizedEffort];
+      if (budget !== undefined && budget > 0) {
+        result.thinking = {
+          type: "enabled",
+          budget_tokens: budget,
+        };
+        // Claude requires max_tokens > budget_tokens
+        if (result.max_tokens <= budget) {
+          result.max_tokens = budget + 8192;
+        }
       }
     }
   }
@@ -398,6 +426,11 @@ function getContentBlocksFromMessage(msg, toolNameMap = new Map(), disableToolPr
             blocks.push({
               type: "image",
               source: { type: "base64", media_type: match[1], data: match[2] },
+            });
+          } else if (typeof url === "string" && url.trim()) {
+            blocks.push({
+              type: "image",
+              source: { type: "url", url },
             });
           }
         } else if (part.type === "image" && part.source) {
@@ -471,7 +504,20 @@ function getContentBlocksFromMessage(msg, toolNameMap = new Map(), disableToolPr
 // Convert OpenAI tool choice to Claude format
 function convertOpenAIToolChoice(choice) {
   if (!choice) return { type: "auto" };
-  if (typeof choice === "object" && choice.type) return choice;
+  if (typeof choice === "object" && choice.type) {
+    // OpenAI sends {type: "function", function: {name}} — convert to Claude {type: "tool", name}
+    if (choice.type === "function" && choice.function?.name) {
+      return { type: "tool", name: choice.function.name };
+    }
+    // Map OpenAI string types to Claude equivalents
+    if (choice.type === "auto" || choice.type === "none") return { type: "auto" };
+    if (choice.type === "required" || choice.type === "any")
+      return { type: CLAUDE_TOOL_CHOICE_REQUIRED };
+    // If type is "tool" already (Claude-native), pass through
+    if (choice.type === "tool" && choice.name) return choice;
+    // Fallback: unknown object type — default to auto to avoid 400 errors
+    return { type: "auto" };
+  }
   if (choice === "auto" || choice === "none") return { type: "auto" };
   if (choice === "required") return { type: CLAUDE_TOOL_CHOICE_REQUIRED };
   if (typeof choice === "object" && choice.function) {

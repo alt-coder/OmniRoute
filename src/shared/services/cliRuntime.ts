@@ -109,6 +109,13 @@ const CLI_TOOLS: Record<string, any> = {
       config: ".config/opencode/opencode.json",
     },
   },
+  amp: {
+    defaultCommand: "amp",
+    envBinKey: "CLI_AMP_BIN",
+    requiresBinary: true,
+    healthcheckTimeoutMs: 12000,
+    paths: {},
+  },
   qoder: {
     defaultCommand: "qodercli",
     envBinKey: "CLI_QODER_BIN",
@@ -117,6 +124,16 @@ const CLI_TOOLS: Record<string, any> = {
     paths: {
       config: ".qoder/settings.json",
       auth: ".qoder/auth.json",
+    },
+  },
+  qwen: {
+    defaultCommand: "qwen",
+    envBinKey: "CLI_QWEN_BIN",
+    requiresBinary: true,
+    healthcheckTimeoutMs: 12000,
+    paths: {
+      settings: ".qwen/settings.json",
+      env: ".qwen/.env",
     },
   },
 };
@@ -149,7 +166,15 @@ const parseBoolean = (value: unknown, defaultValue = true) => {
 const runProcess = (
   command: string,
   args: string[],
-  { env, timeoutMs = 3000 }: { env?: Record<string, string | undefined>; timeoutMs?: number } = {}
+  {
+    env,
+    timeoutMs = 3000,
+    useShell = isWindows(),
+  }: {
+    env?: Record<string, string | undefined>;
+    timeoutMs?: number;
+    useShell?: boolean;
+  } = {}
 ): Promise<any> =>
   new Promise((resolve) => {
     let stdout = "";
@@ -163,7 +188,7 @@ const runProcess = (
       // On Windows, npm installs CLI wrappers as .cmd scripts (e.g. claude.cmd).
       // Without shell:true, spawn cannot resolve them via PATHEXT and the
       // healthcheck fails even when the CLI is correctly installed (#447).
-      ...(isWindows() ? { shell: true } : {}),
+      ...(useShell ? { shell: true } : {}),
     });
     const timer = setTimeout(() => {
       timedOut = true;
@@ -400,7 +425,10 @@ const getKnownToolPaths = (toolId: string): string[] => {
     cline: [["cline.cmd", "cline"]],
     kilo: [["kilocode.cmd", "kilocode"]],
     opencode: [["opencode.cmd", "opencode"]],
-    qoder: [["qodercli.exe", "qodercli"]],
+    qoder: [
+      ["qodercli.cmd", "qodercli"],
+      ["qodercli.exe", "qodercli"],
+    ],
   };
 
   const bins = toolBins[toolId] || [];
@@ -485,11 +513,19 @@ const getNvmNodePath = (): string | null => {
 const getLookupEnv = () => {
   const env = { ...process.env };
   const extraPaths = getExtraPaths();
+  const currentPath = env.PATH || env.Path || "";
 
   // Only add user-specified extra paths, NOT generic user directories
   // This is more secure - user explicitly opts in via CLI_EXTRA_PATHS
   if (extraPaths.length > 0) {
-    env.PATH = [...extraPaths, env.PATH || ""].filter(Boolean).join(path.delimiter);
+    const mergedPath = [...extraPaths, currentPath].filter(Boolean).join(path.delimiter);
+    env.PATH = mergedPath;
+    if (isWindows()) {
+      env.Path = mergedPath;
+    }
+  } else if (isWindows() && currentPath) {
+    env.PATH = currentPath;
+    env.Path = currentPath;
   }
   return env;
 };
@@ -535,7 +571,11 @@ const locateCommand = async (command: string, env: Record<string, string | undef
   }
 
   if (isWindows()) {
-    const located = await runProcess("where", [command], { env, timeoutMs: 3000 });
+    const located = await runProcess("where.exe", [command], {
+      env,
+      timeoutMs: 3000,
+      useShell: false,
+    });
     if (located.ok && located.stdout) {
       // `where` may return multiple matches (e.g. `opencode` + `opencode.cmd`).
       // npm global installs on Windows create both a Unix shell script (no extension)
@@ -549,7 +589,7 @@ const locateCommand = async (command: string, env: Record<string, string | undef
       }
       const winExt = /\.(cmd|exe|bat|com)$/i;
       const preferred = lines.find((l) => winExt.test(l)) || lines[0];
-      return { installed: true, commandPath: preferred, reason: null };
+      return { installed: true, commandPath: normalizeMsys2Path(preferred), reason: null };
     }
     return { installed: false, commandPath: null, reason: "not_found" };
   }
@@ -587,8 +627,26 @@ const checkKnownPath = async (commandPath: string) => {
     const realPath = await fs.realpath(commandPath);
 
     // Verify the resolved path is still within expected directories
-    // Use pre-computed expected parent paths (cached at module startup for performance)
-    const isWithinExpected = EXPECTED_PARENT_PATHS.some((parent) => isPathWithin(realPath, parent));
+    // Use pre-computed expected parent paths (cached at module startup for performance).
+    // On macOS temp directories often resolve from /var -> /private/var, so compare both
+    // the configured parent and its canonical realpath when available.
+    let isWithinExpected = false;
+    for (const parent of EXPECTED_PARENT_PATHS) {
+      if (isPathWithin(realPath, parent)) {
+        isWithinExpected = true;
+        break;
+      }
+
+      try {
+        const resolvedParent = await fs.realpath(parent);
+        if (isPathWithin(realPath, resolvedParent)) {
+          isWithinExpected = true;
+          break;
+        }
+      } catch {
+        // Ignore missing/unresolvable parents and continue checking the remaining ones.
+      }
+    }
 
     if (!isWithinExpected) {
       return { installed: false, commandPath: null, reason: "symlink_escape" };
@@ -670,7 +728,7 @@ const checkRunnable = async (
 ) => {
   // Minimal environment to prevent credential leakage to potentially malicious binaries
   const minimalEnv: Record<string, string | undefined> = {
-    PATH: env.PATH,
+    PATH: env.PATH || env.Path,
     HOME: env.HOME || env.USERPROFILE,
     USERPROFILE: env.USERPROFILE, // Windows needs this for os.homedir()
     APPDATA: env.APPDATA, // Many npm CLI tools rely on APPDATA
@@ -681,6 +739,10 @@ const checkRunnable = async (
     ComSpec: env.ComSpec, // Windows shell
     PATHEXT: env.PATHEXT, // Windows cmd.exe needs this to resolve .cmd/.bat/.exe extensions
   };
+
+  if (isWindows() && minimalEnv.PATH) {
+    minimalEnv.Path = minimalEnv.PATH;
+  }
 
   for (const args of [["--version"], ["-v"]]) {
     const result = await runProcess(commandPath, args, { env: minimalEnv, timeoutMs });

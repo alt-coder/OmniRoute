@@ -1,5 +1,5 @@
 /**
- * OmniRoute MCP Advanced Tools — 10 intelligence tools that differentiate
+ * OmniRoute MCP Advanced Tools — 11 intelligence tools that differentiate
  * OmniRoute from all other AI gateways.
  *
  * Tools:
@@ -12,13 +12,20 @@
  *   7. omniroute_best_combo_for_task — AI-powered combo recommendation
  *   8. omniroute_explain_route      — Post-hoc routing decision explainer
  *   9. omniroute_get_session_snapshot — Full session state snapshot
- *  10. omniroute_sync_pricing      — Sync provider pricing from external source
+ *  10. omniroute_db_health_check   — Diagnose and repair DB state drift
+ *  11. omniroute_sync_pricing      — Sync provider pricing from external source
  */
 
 import { logToolCall } from "../audit.ts";
 import { normalizeQuotaResponse } from "../../../src/shared/contracts/quota.ts";
+import { resolveOmniRouteBaseUrl } from "../../../src/shared/utils/resolveOmniRouteBaseUrl.ts";
+import {
+  getComboModelProvider,
+  getComboModelString,
+  getComboStepTarget,
+} from "../../../src/lib/combos/steps.ts";
 
-const OMNIROUTE_BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://localhost:20128";
+const OMNIROUTE_BASE_URL = resolveOmniRouteBaseUrl();
 const OMNIROUTE_API_KEY = process.env.OMNIROUTE_API_KEY || "";
 
 async function apiFetch(path: string, options: RequestInit = {}): Promise<unknown> {
@@ -79,8 +86,8 @@ function getComboModels(combo: JsonRecord): ComboModel[] {
   const nestedModels = toArrayOfRecords(toRecord(combo.data).models);
   const sourceModels = directModels.length > 0 ? directModels : nestedModels;
   return sourceModels.map((model) => ({
-    provider: toString(model.provider, "unknown"),
-    model: toString(model.model, ""),
+    provider: getComboModelProvider(model) || (getComboModelString(model) ? "unknown" : "combo"),
+    model: getComboModelString(model) || getComboStepTarget(model) || "",
     inputCostPer1M: toNumber(model.inputCostPer1M, 3.0),
   }));
 }
@@ -343,6 +350,7 @@ export async function handleSetRoutingStrategy(args: {
     | "priority"
     | "weighted"
     | "round-robin"
+    | "context-relay"
     | "strict-random"
     | "random"
     | "least-used"
@@ -853,6 +861,36 @@ export async function handleGetSessionSnapshot() {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await logToolCall("omniroute_get_session_snapshot", {}, null, Date.now() - start, false, msg);
+    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+  }
+}
+
+export async function handleDbHealthCheck(args: { autoRepair?: boolean }) {
+  const start = Date.now();
+  const autoRepair = args.autoRepair === true;
+
+  try {
+    const result = toRecord(
+      await apiFetch("/api/v1/db/health", {
+        method: autoRepair ? "POST" : "GET",
+      })
+    );
+
+    await logToolCall(
+      "omniroute_db_health_check",
+      args,
+      {
+        isHealthy: toBoolean(result.isHealthy, false),
+        repairedCount: toNumber(result.repairedCount, 0),
+      },
+      Date.now() - start,
+      true
+    );
+
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await logToolCall("omniroute_db_health_check", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
 }

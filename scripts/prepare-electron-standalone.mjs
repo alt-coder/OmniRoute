@@ -83,6 +83,14 @@ function ensurePackage(pkgPath, sourcePath) {
   cpSync(sourcePath, pkgPath, { recursive: true, dereference: true });
 }
 
+function removeGeneratedElectronArtifacts() {
+  const generatedDirs = [join(ELECTRON_STANDALONE_DIR, "electron", "dist-electron")];
+
+  for (const dir of generatedDirs) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 function assertBundleIsPackagable(bundleDir) {
   const nodeModulesPath = join(bundleDir, "node_modules");
   if (!existsSync(nodeModulesPath)) return;
@@ -131,15 +139,18 @@ if (existsSync(PUBLIC_SRC)) {
   cpSync(PUBLIC_SRC, PUBLIC_DEST, { recursive: true, dereference: true });
 }
 
+removeGeneratedElectronArtifacts();
+
 ensurePackage(
   join(ELECTRON_STANDALONE_DIR, "node_modules", "@swc", "helpers"),
   join(ROOT, "node_modules", "@swc", "helpers")
 );
 
-ensurePackage(
-  join(ELECTRON_STANDALONE_DIR, "node_modules", "better-sqlite3"),
-  join(ROOT, "node_modules", "better-sqlite3")
-);
+// removed better-sqlite3 to ensure ABI compatibility via electron-builder
+const bundledSqlite = join(ELECTRON_STANDALONE_DIR, "node_modules", "better-sqlite3");
+if (existsSync(bundledSqlite)) {
+  rmSync(bundledSqlite, { recursive: true, force: true });
+}
 
 console.log(
   `[electron] prepared standalone bundle: ${relative(ROOT, ELECTRON_STANDALONE_DIR) || "."}`

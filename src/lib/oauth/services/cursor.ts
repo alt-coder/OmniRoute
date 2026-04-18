@@ -1,4 +1,5 @@
 import { CURSOR_CONFIG } from "../constants/oauth";
+import { getCursorUserAgent } from "@omniroute/open-sse/config/providerHeaderProfiles.ts";
 
 /**
  * Cursor IDE OAuth Service
@@ -51,11 +52,13 @@ export class CursorService {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/connect+proto",
       "Connect-Protocol-Version": "1",
+      "User-Agent": getCursorUserAgent(this.config.clientVersion),
       "x-cursor-client-version": this.config.clientVersion,
       "x-cursor-client-type": this.config.clientType,
       "x-cursor-client-os": this.detectOS(),
       "x-cursor-client-arch": this.detectArch(),
       "x-cursor-client-device-type": "desktop",
+      "x-cursor-user-agent": getCursorUserAgent(this.config.clientVersion),
       "x-cursor-checksum": checksum,
       "x-ghost-mode": ghostMode ? "true" : "false",
     };
@@ -88,20 +91,16 @@ export class CursorService {
   }
 
   /**
-   * Validate and import token from Cursor IDE
+   * Validate and import token from Cursor IDE or cursor-agent CLI.
    * Note: We skip API validation because Cursor API uses complex protobuf format.
    * Token will be validated when actually used for requests.
-   * @param {string} accessToken - Access token from state.vscdb
-   * @param {string} machineId - Machine ID from state.vscdb
+   * @param {string} accessToken - Access token from state.vscdb or auth.json
+   * @param {string} [machineId] - Machine ID from state.vscdb (optional for cursor-agent imports)
    */
-  async validateImportToken(accessToken: string, machineId: string) {
+  async validateImportToken(accessToken: string, machineId?: string) {
     // Basic validation
     if (!accessToken || typeof accessToken !== "string") {
       throw new Error("Access token is required");
-    }
-
-    if (!machineId || typeof machineId !== "string") {
-      throw new Error("Machine ID is required");
     }
 
     // Token format validation (Cursor tokens are typically long strings)
@@ -109,10 +108,12 @@ export class CursorService {
       throw new Error("Invalid token format. Token appears too short.");
     }
 
-    // Machine ID format validation (should be UUID-like)
-    const uuidRegex = /^[a-f0-9-]{32,}$/i;
-    if (!uuidRegex.test(machineId.replace(/-/g, ""))) {
-      throw new Error("Invalid machine ID format. Expected UUID format.");
+    // Machine ID format validation (only if provided — cursor-agent imports don't have one)
+    if (machineId) {
+      const uuidRegex = /^[a-f0-9-]{32,}$/i;
+      if (!uuidRegex.test(machineId.replace(/-/g, ""))) {
+        throw new Error("Invalid machine ID format. Expected UUID format.");
+      }
     }
 
     // Note: We don't validate against API because Cursor uses complex protobuf.
@@ -120,9 +121,9 @@ export class CursorService {
 
     return {
       accessToken,
-      machineId,
+      machineId: machineId || null,
       expiresIn: 86400, // Cursor tokens typically last 24 hours
-      authMethod: "imported",
+      authMethod: machineId ? "imported" : "cursor-agent",
     };
   }
 

@@ -6,6 +6,7 @@
  */
 
 import { REGISTRY } from "../config/providerRegistry.ts";
+import { getModelContextLimit } from "../../src/lib/modelCapabilities.ts";
 
 // Default token limits per provider (fallbacks when not in registry)
 const DEFAULT_LIMITS: Record<string, number> = {
@@ -33,13 +34,23 @@ function getEnvOverride(provider: string): number | null {
   return null;
 }
 
+// Reserve tokens override from environment variable
+function getReserveTokensOverride(): number | null {
+  const envValue = process.env.CONTEXT_RESERVE_TOKENS;
+  if (envValue) {
+    const parsed = parseInt(envValue, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
+
 // Rough chars-per-token ratio for quick estimation
 const CHARS_PER_TOKEN = 4;
 
 /**
  * Estimate token count from text length
  */
-export function estimateTokens(text) {
+export function estimateTokens(text: string | object | null | undefined): number {
   if (!text) return 0;
   const str = typeof text === "string" ? text : JSON.stringify(text);
   return Math.ceil(str.length / CHARS_PER_TOKEN);
@@ -47,20 +58,26 @@ export function estimateTokens(text) {
 
 /**
  * Get token limit for a provider/model combination
- * Priority: Env override > Registry defaultContextLength > DEFAULT_LIMITS
+ * Priority: Env override > models.dev DB > Registry defaultContextLength > DEFAULT_LIMITS
  */
-export function getTokenLimit(provider, model = null) {
+export function getTokenLimit(provider: string, model: string | null = null): number {
   // 1. Check environment variable override first
   const envOverride = getEnvOverride(provider);
   if (envOverride) return envOverride;
 
-  // 2. Check registry for provider default
+  // 2. Check models.dev synced DB for per-model context limit
+  if (model) {
+    const dbLimit = getModelContextLimit(provider, model);
+    if (dbLimit && dbLimit > 0) return dbLimit;
+  }
+
+  // 3. Check registry for provider default
   const registryEntry = REGISTRY[provider];
   if (registryEntry?.defaultContextLength) {
     return registryEntry.defaultContextLength;
   }
 
-  // 3. Check if model name hints at a known limit
+  // 4. Check if model name hints at a known limit
   if (model) {
     const lower = model.toLowerCase();
     if (lower.includes("claude")) return DEFAULT_LIMITS.claude;
@@ -75,7 +92,7 @@ export function getTokenLimit(provider, model = null) {
       return DEFAULT_LIMITS.codex;
   }
 
-  // 4. Fallback to DEFAULT_LIMITS or default
+  // 5. Fallback to DEFAULT_LIMITS or default
   return DEFAULT_LIMITS[provider] || DEFAULT_LIMITS.default;
 }
 
@@ -92,7 +109,7 @@ export function getTokenLimit(provider, model = null) {
  * @returns {{ body: object, compressed: boolean, stats: object }}
  */
 export function compressContext(
-  body,
+  body: Record<string, unknown>,
   options: { provider?: string; model?: string; maxTokens?: number; reserveTokens?: number } = {}
 ) {
   if (!body || !body.messages || !Array.isArray(body.messages)) {
@@ -100,9 +117,14 @@ export function compressContext(
   }
 
   const provider = options.provider || "default";
-  const maxTokens = options.maxTokens || getTokenLimit(provider, body.model || options.model);
-  const reserveTokens = options.reserveTokens || 16000; // Reserve for response
-  const targetTokens = maxTokens - reserveTokens;
+  const maxTokens =
+    options.maxTokens || getTokenLimit(provider, (body.model as string) || options.model || null);
+  const defaultReserveTokens = Math.min(16000, Math.max(256, Math.floor(maxTokens * 0.15)));
+  const reserveTokens = Math.min(
+    options.reserveTokens ?? getReserveTokensOverride() ?? defaultReserveTokens,
+    Math.max(0, maxTokens - 1)
+  );
+  const targetTokens = Math.max(0, maxTokens - reserveTokens);
 
   let messages = [...body.messages];
   let currentTokens = estimateTokens(JSON.stringify(messages));
@@ -153,7 +175,7 @@ export function compressContext(
 
 // ─── Layer 1: Trim Tool Messages ────────────────────────────────────────────
 
-function trimToolMessages(messages, maxChars) {
+function trimToolMessages(messages: Record<string, unknown>[], maxChars: number) {
   return messages.map((msg) => {
     if (msg.role === "tool" && typeof msg.content === "string" && msg.content.length > maxChars) {
       return {
@@ -183,7 +205,7 @@ function trimToolMessages(messages, maxChars) {
 
 // ─── Layer 2: Compress Thinking Blocks ──────────────────────────────────────
 
-function compressThinking(messages) {
+function compressThinking(messages: Record<string, unknown>[]) {
   // Find last assistant message index
   let lastAssistantIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -208,10 +230,23 @@ function compressThinking(messages) {
 
     // Remove thinking XML tags from string content
     if (typeof msg.content === "string") {
-      const cleaned = msg.content
-        .replace(/<thinking>[\s\S]*?<\/thinking>/g, "")
-        .replace(/<antThinking>[\s\S]*?<\/antThinking>/g, "")
-        .trim();
+      let cleaned = msg.content;
+      for (const [start, end] of [
+        ["<thinking>", "</thinking>"],
+        ["<antThinking>", "</antThinking>"],
+      ]) {
+        while (true) {
+          const s = cleaned.indexOf(start);
+          if (s === -1) break;
+          const e = cleaned.indexOf(end, s + start.length);
+          if (e === -1) {
+            cleaned = cleaned.slice(0, s);
+            break;
+          }
+          cleaned = cleaned.slice(0, s) + cleaned.slice(e + end.length);
+        }
+      }
+      cleaned = cleaned.trim();
       return { ...msg, content: cleaned || "[thinking compressed]" };
     }
 
@@ -221,7 +256,7 @@ function compressThinking(messages) {
 
 // ─── Layer 3: Aggressive Purification ───────────────────────────────────────
 
-function purifyHistory(messages, targetTokens) {
+function purifyHistory(messages: Record<string, unknown>[], targetTokens: number) {
   // Keep system message(s) and the last N message pairs
   const system = messages.filter((m) => m.role === "system" || m.role === "developer");
   const nonSystem = messages.filter((m) => m.role !== "system" && m.role !== "developer");
@@ -229,13 +264,15 @@ function purifyHistory(messages, targetTokens) {
   // Binary search for how many messages to keep from the end
   let keep = nonSystem.length;
   while (keep > 2) {
-    const candidate = [...system, ...nonSystem.slice(-keep)];
+    let candidate = [...system, ...nonSystem.slice(-keep)];
+    candidate = fixToolPairs(candidate);
     const tokens = estimateTokens(JSON.stringify(candidate));
     if (tokens <= targetTokens) break;
     keep = Math.max(2, Math.floor(keep * 0.7)); // Drop 30% each iteration
   }
 
-  const result = [...system, ...nonSystem.slice(-keep)];
+  let result = [...system, ...nonSystem.slice(-keep)];
+  result = fixToolPairs(result);
 
   // Add summary of dropped messages
   if (keep < nonSystem.length) {
@@ -247,4 +284,60 @@ function purifyHistory(messages, targetTokens) {
   }
 
   return result;
+}
+
+/**
+ * Remove orphaned tool_result messages whose preceding tool_use was dropped.
+ * Also removes orphaned tool_use messages without a corresponding tool_result.
+ *
+ * When purifyHistory() drops oldest messages, it can split tool_use/tool_result
+ * pairs — keeping the tool_result but dropping the tool_use that initiated it.
+ * This causes upstream providers to reject the request with errors like:
+ *   - Claude: "tool_result message must be preceded by a tool_use message"
+ *   - OpenAI: "Invalid message format"
+ *   - Gemini: "Function response without function call"
+ */
+function fixToolPairs(messages: Record<string, unknown>[]) {
+  // Collect all tool_call IDs from assistant messages that remain
+  const toolCallIds = new Set();
+  for (const msg of messages) {
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        if (tc.id) toolCallIds.add(tc.id);
+      }
+    }
+    // Claude format: content blocks with type=tool_use
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === "tool_use" && block.id) {
+          toolCallIds.add(block.id);
+        }
+      }
+    }
+  }
+
+  // Remove tool_result / "tool" role messages without a matching tool_use
+  return messages.filter((msg) => {
+    // OpenAI format: role="tool" with tool_call_id
+    if (msg.role === "tool" && msg.tool_call_id) {
+      return toolCallIds.has(msg.tool_call_id);
+    }
+    // Claude format: user message with tool_result content blocks
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const hasOrphanedResult = msg.content.some(
+        (block) =>
+          block.type === "tool_result" && block.tool_use_id && !toolCallIds.has(block.tool_use_id)
+      );
+      if (hasOrphanedResult) {
+        // Filter out only the orphaned blocks, keep the rest
+        const filtered = msg.content.filter(
+          (block) =>
+            block.type !== "tool_result" || !block.tool_use_id || toolCallIds.has(block.tool_use_id)
+        );
+        // If nothing left after filtering, drop the entire message
+        return filtered.length > 0;
+      }
+    }
+    return true;
+  });
 }

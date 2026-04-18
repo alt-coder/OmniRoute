@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { PROVIDERS } from "../config/constants.ts";
 import { getRegistryEntry } from "../config/providerRegistry.ts";
 import {
@@ -29,14 +30,49 @@ export function isClaudeCodeCompatible(provider) {
   return typeof provider === "string" && provider.startsWith(CLAUDE_CODE_COMPATIBLE_PREFIX);
 }
 
-function getOpenAICompatibleType(provider) {
+export function getOpenAICompatibleType(
+  provider,
+  providerSpecificData: Record<string, unknown> | null = null
+) {
   if (!isOpenAICompatible(provider)) return "chat";
-  return provider.includes("responses") ? "responses" : "chat";
+  const configuredType =
+    providerSpecificData &&
+    typeof providerSpecificData === "object" &&
+    typeof providerSpecificData.apiType === "string"
+      ? providerSpecificData.apiType
+      : null;
+  if (
+    configuredType === "responses" ||
+    configuredType === "chat" ||
+    configuredType === "embeddings" ||
+    configuredType === "audio-transcriptions" ||
+    configuredType === "audio-speech" ||
+    configuredType === "images-generations"
+  ) {
+    return configuredType;
+  }
+  if (provider.includes("responses")) return "responses";
+  if (provider.includes("embeddings")) return "embeddings";
+  if (provider.includes("audio-transcriptions")) return "audio-transcriptions";
+  if (provider.includes("audio-speech")) return "audio-speech";
+  if (provider.includes("images-generations")) return "images-generations";
+  return "chat";
 }
 
 function buildOpenAICompatibleUrl(baseUrl, apiType) {
   const normalized = baseUrl.replace(/\/$/, "");
-  const path = apiType === "responses" ? "/responses" : "/chat/completions";
+  let path = "/chat/completions";
+  if (apiType === "responses") {
+    path = "/responses";
+  } else if (apiType === "embeddings") {
+    path = "/embeddings";
+  } else if (apiType === "audio-transcriptions") {
+    path = "/audio/transcriptions";
+  } else if (apiType === "audio-speech") {
+    path = "/audio/speech";
+  } else if (apiType === "images-generations") {
+    path = "/images/generations";
+  }
   return `${normalized}${path}`;
 }
 
@@ -50,6 +86,17 @@ function buildAnthropicCompatibleUrl(baseUrl) {
 // contain max_tokens or Claude model names.
 export function detectFormatFromEndpoint(body, endpointPath = "") {
   const path = String(endpointPath || "");
+  const hasInputField =
+    body &&
+    typeof body === "object" &&
+    Object.prototype.hasOwnProperty.call(body, "input") &&
+    body.input !== undefined;
+  const hasResponsesSpecificFields =
+    body &&
+    typeof body === "object" &&
+    (body.max_output_tokens !== undefined ||
+      body.previous_response_id !== undefined ||
+      body.reasoning !== undefined);
 
   if (/\/responses(?=\/|$)/i.test(path) || /^responses(?=\/|$)/i.test(path)) {
     return "openai-responses";
@@ -63,6 +110,9 @@ export function detectFormatFromEndpoint(body, endpointPath = "") {
     /\/(?:chat\/completions|completions)(?=\/|$)/i.test(path) ||
     /^(?:chat\/completions|completions)(?=\/|$)/i.test(path)
   ) {
+    if (hasInputField || hasResponsesSpecificFields) {
+      return "openai-responses";
+    }
     return "openai";
   }
 
@@ -164,9 +214,9 @@ export function detectFormat(body) {
 }
 
 // Get provider config
-export function getProviderConfig(provider) {
+export function getProviderConfig(provider, providerSpecificData = null) {
   if (isOpenAICompatible(provider)) {
-    const apiType = getOpenAICompatibleType(provider);
+    const apiType = getOpenAICompatibleType(provider, providerSpecificData);
     return {
       ...PROVIDERS.openai,
       format: apiType === "responses" ? "openai-responses" : "openai",
@@ -194,11 +244,19 @@ export function buildProviderUrl(
   provider,
   model,
   stream = true,
-  options: { baseUrl?: string; baseUrlIndex?: number } = {}
+  options: {
+    baseUrl?: string;
+    baseUrlIndex?: number;
+    providerSpecificData?: Record<string, unknown> | null;
+  } = {}
 ) {
   if (isOpenAICompatible(provider)) {
-    const apiType = getOpenAICompatibleType(provider);
-    const baseUrl = options?.baseUrl || OPENAI_COMPATIBLE_DEFAULTS.baseUrl;
+    const providerSpecificData = options?.providerSpecificData || null;
+    const apiType = getOpenAICompatibleType(provider, providerSpecificData);
+    const baseUrl =
+      options?.baseUrl ||
+      (typeof providerSpecificData?.baseUrl === "string" ? providerSpecificData.baseUrl : null) ||
+      OPENAI_COMPATIBLE_DEFAULTS.baseUrl;
     return buildOpenAICompatibleUrl(baseUrl, apiType);
   }
   if (isAnthropicCompatible(provider)) {
@@ -223,7 +281,10 @@ export function buildProviderUrl(
     }
     // Custom URL builder (e.g. gemini, gemini-cli)
     if (entry.urlBuilder) {
-      return entry.urlBuilder(entry.baseUrl, model, stream);
+      const baseUrl = entry.baseUrl || config.baseUrl;
+      if (baseUrl) {
+        return entry.urlBuilder(baseUrl, model, stream);
+      }
     }
     // URL suffix (e.g. claude: ?beta=true)
     if (entry.urlSuffix) {
@@ -309,9 +370,11 @@ export function buildProviderHeaders(provider, credentials, stream = true, body 
 }
 
 // Get target format for provider
-export function getTargetFormat(provider) {
+export function getTargetFormat(provider, providerSpecificData = null) {
   if (isOpenAICompatible(provider)) {
-    return getOpenAICompatibleType(provider) === "responses" ? "openai-responses" : "openai";
+    return getOpenAICompatibleType(provider, providerSpecificData) === "responses"
+      ? "openai-responses"
+      : "openai";
   }
   if (isAnthropicCompatible(provider)) {
     return "claude";

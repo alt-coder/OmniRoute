@@ -14,6 +14,7 @@ import {
   getLoggedOutputTokens,
   getPromptCacheCreationTokens,
   getPromptCacheReadTokens,
+  getReasoningTokens,
 } from "./tokenAccounting";
 
 type JsonRecord = Record<string, unknown>;
@@ -107,9 +108,13 @@ export function getPendingRequests() {
  * Returns an object compatible with the old LowDB interface.
  * Only `api/usage/analytics/route.js` uses this — it reads `db.data.history`.
  */
-export async function getUsageDb() {
+export async function getUsageDb(sinceIso?: string | null) {
   const db = getDbInstance();
-  const rows = db.prepare("SELECT * FROM usage_history ORDER BY timestamp ASC").all();
+  const rows = sinceIso
+    ? db
+        .prepare("SELECT * FROM usage_history WHERE timestamp >= ? ORDER BY timestamp ASC")
+        .all(sinceIso)
+    : db.prepare("SELECT * FROM usage_history ORDER BY timestamp ASC").all();
 
   const history = rows.map((row) => {
     const r = asRecord(row);
@@ -167,7 +172,7 @@ export async function saveRequestUsage(entry: any) {
       getLoggedOutputTokens(entry.tokens),
       getPromptCacheReadTokens(entry.tokens),
       getPromptCacheCreationTokens(entry.tokens),
-      entry.tokens?.reasoning ?? entry.tokens?.reasoning_tokens ?? 0,
+      getReasoningTokens(entry.tokens),
       entry.status || null,
       entry.success === false ? 0 : 1,
       Number.isFinite(Number(entry.latencyMs)) ? Number(entry.latencyMs) : 0,

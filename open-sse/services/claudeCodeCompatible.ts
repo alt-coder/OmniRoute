@@ -1,17 +1,67 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { getStainlessTimeoutSeconds } from "@/shared/utils/runtimeTimeouts";
+import {
+  ANTHROPIC_BETA_FULL,
+  ANTHROPIC_VERSION_HEADER,
+  CLAUDE_CLI_STAINLESS_PACKAGE_VERSION,
+  CLAUDE_CLI_STAINLESS_RUNTIME_VERSION,
+  CLAUDE_CLI_USER_AGENT,
+  CLAUDE_CLI_VERSION,
+} from "../config/anthropicHeaders.ts";
+import { supportsXHighEffort } from "../config/providerModels.ts";
 import { prepareClaudeRequest } from "../translator/helpers/claudeHelper.ts";
+import { signRequestBody } from "./claudeCodeCCH.ts";
+import { computeFingerprint, extractFirstUserMessageText } from "./claudeCodeFingerprint.ts";
+import { remapToolNamesInRequest } from "./claudeCodeToolRemapper.ts";
+import {
+  enforceThinkingTemperature,
+  disableThinkingIfToolChoiceForced,
+  enforceCacheControlLimit,
+} from "./claudeCodeConstraints.ts";
+import { obfuscateInBody } from "./claudeCodeObfuscation.ts";
 
+/**
+ * `anthropic-compatible-cc-*` targets Anthropic relay gateways that only accept
+ * traffic which looks like the official Claude Code client, often because those
+ * gateways resell the same models at materially lower prices than the direct API.
+ *
+ * This bridge is intentionally compatibility-first, not lossless. We normalize
+ * requests into the smallest Claude Code-shaped surface that consistently passes
+ * provider-side client checks, instead of trying to preserve every original
+ * field one-to-one.
+ */
 export const CLAUDE_CODE_COMPATIBLE_PREFIX = "anthropic-compatible-cc-";
 export const CLAUDE_CODE_COMPATIBLE_DEFAULT_CHAT_PATH = "/v1/messages?beta=true";
 export const CLAUDE_CODE_COMPATIBLE_DEFAULT_MODELS_PATH = "/models";
 export const CLAUDE_CODE_COMPATIBLE_DEFAULT_MAX_TOKENS = 8092;
-export const CLAUDE_CODE_COMPATIBLE_ANTHROPIC_VERSION = "2023-06-01";
-export const CLAUDE_CODE_COMPATIBLE_ANTHROPIC_BETA =
-  "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24";
-export const CLAUDE_CODE_COMPATIBLE_USER_AGENT = "claude-cli/2.1.89 (external, sdk-cli)";
-export const CLAUDE_CODE_COMPATIBLE_BILLING_HEADER =
-  "x-anthropic-billing-header: cc_version=2.1.89.728; cc_entrypoint=sdk-cli; cch=00000;";
+export const CLAUDE_CODE_COMPATIBLE_ANTHROPIC_VERSION = ANTHROPIC_VERSION_HEADER;
+export const CLAUDE_CODE_COMPATIBLE_ANTHROPIC_BETA = ANTHROPIC_BETA_FULL;
+export const CLAUDE_CODE_COMPATIBLE_VERSION = CLAUDE_CLI_VERSION;
+export const CLAUDE_CODE_COMPATIBLE_USER_AGENT = CLAUDE_CLI_USER_AGENT;
+export const CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07";
+const CONTEXT_1M_SUPPORTED_MODELS = [
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-sonnet-4-6",
+  "claude-sonnet-4-5",
+  "claude-sonnet-4",
+];
+/**
+ * Build the billing header dynamically with fingerprint and CCH placeholder.
+ * The cch=00000 placeholder is later replaced by signRequestBody().
+ */
+export function buildBillingHeader(messages?: Array<{ role?: string; content?: unknown }>): string {
+  const msgText = extractFirstUserMessageText(messages);
+  const fp = computeFingerprint(msgText, CLAUDE_CODE_COMPATIBLE_VERSION);
+  return `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_COMPATIBLE_VERSION}.${fp}; cc_entrypoint=cli; cch=00000;`;
+}
+
+/** @deprecated Use buildBillingHeader() for dynamic fingerprint */
+export const CLAUDE_CODE_COMPATIBLE_BILLING_HEADER = `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_COMPATIBLE_VERSION}.000; cc_entrypoint=cli; cch=00000;`;
+export const CLAUDE_CODE_COMPATIBLE_STAINLESS_TIMEOUT_SECONDS = getStainlessTimeoutSeconds(
+  process.env
+);
 
 type HeaderLike =
   | Headers
@@ -36,6 +86,10 @@ type BuildRequestOptions = {
   sessionId?: string | null;
   preserveCacheControl?: boolean;
 };
+
+function supportsClaudeXHighEffort(model: string | null | undefined): boolean {
+  return typeof model === "string" && supportsXHighEffort("claude", model);
+}
 
 export function isClaudeCodeCompatibleProvider(provider: string | null | undefined): boolean {
   return typeof provider === "string" && provider.startsWith(CLAUDE_CODE_COMPATIBLE_PREFIX);
@@ -82,11 +136,45 @@ export function joinClaudeCodeCompatibleUrl(baseUrl: string, path: string): stri
   return joinNormalizedBaseUrlAndPath(stripClaudeCodeCompatibleEndpointSuffix(baseUrl), path);
 }
 
+export function appendAnthropicBetaHeader(
+  headers: Record<string, string>,
+  betaHeader: string
+): void {
+  const existingKey = Object.keys(headers).find((key) => key.toLowerCase() === "anthropic-beta");
+  if (!existingKey) {
+    headers["anthropic-beta"] = betaHeader;
+    return;
+  }
+
+  const existingValues = String(headers[existingKey] || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (!existingValues.includes(betaHeader)) {
+    headers[existingKey] = [...existingValues, betaHeader].join(",");
+  }
+}
+
+export function modelSupportsContext1mBeta(model: string | null | undefined): boolean {
+  const normalizedModel = String(model || "")
+    .trim()
+    .toLowerCase()
+    .replace(/-\d{8}$/, "");
+
+  return CONTEXT_1M_SUPPORTED_MODELS.some(
+    (supported) => normalizedModel === supported || normalizedModel.startsWith(`${supported}-`)
+  );
+}
+
 export function buildClaudeCodeCompatibleHeaders(
   apiKey: string,
   stream = false,
   sessionId?: string | null
 ): Record<string, string> {
+  // These headers intentionally mirror Claude Code's wire image closely.
+  // For CC-compatible relays, passing the upstream's client-gating checks is
+  // more important than forwarding arbitrary caller-specific header shapes.
   return {
     "Content-Type": "application/json",
     Accept: stream ? "text/event-stream" : "application/json",
@@ -97,17 +185,18 @@ export function buildClaudeCodeCompatibleHeaders(
     "x-app": "cli",
     "User-Agent": CLAUDE_CODE_COMPATIBLE_USER_AGENT,
     "X-Stainless-Retry-Count": "0",
-    "X-Stainless-Timeout": "300",
+    "X-Stainless-Timeout": String(CLAUDE_CODE_COMPATIBLE_STAINLESS_TIMEOUT_SECONDS),
     "X-Stainless-Lang": "js",
-    "X-Stainless-Package-Version": "0.74.0",
+    "X-Stainless-Package-Version": CLAUDE_CLI_STAINLESS_PACKAGE_VERSION,
     "X-Stainless-OS": "MacOS",
     "X-Stainless-Arch": "arm64",
     "X-Stainless-Runtime": "node",
-    "X-Stainless-Runtime-Version": "v25.8.1",
+    "X-Stainless-Runtime-Version": CLAUDE_CLI_STAINLESS_RUNTIME_VERSION,
     "accept-language": "*",
     "sec-fetch-mode": "cors",
     "accept-encoding": "identity",
     ...(sessionId ? { "X-Claude-Code-Session-Id": sessionId } : {}),
+    "x-client-request-id": randomUUID(),
   };
 }
 
@@ -161,22 +250,26 @@ export function buildClaudeCodeCompatibleRequest({
     : Array.isArray(normalized.messages)
       ? buildClaudeCodeCompatibleMessages(normalized.messages as MessageLike[])
       : [];
+  const allMessages = (preparedClaudeBody?.messages || normalized.messages || []) as Array<{
+    role?: string;
+    content?: unknown;
+  }>;
+  const billingHeader = buildBillingHeader(allMessages);
   const system = buildClaudeCodeCompatibleSystemBlocks({
     messages: normalized.messages as MessageLike[],
     systemBlocks: preparedClaudeBody?.system as Record<string, unknown>[] | undefined,
     cwd,
     now,
     preserveCacheControl,
+    billingHeader,
   });
   const resolvedSessionId = sessionId || randomUUID();
   const effort = resolveClaudeCodeCompatibleEffort(sourceBody, normalizedBody, model);
   const maxTokens = resolveClaudeCodeCompatibleMaxTokens(sourceBody, normalizedBody);
   const tools = preparedClaudeBody?.tools
-    ? applyClaudeCodeCompatibleToolCacheStrategy(
+    ? buildClaudeCodeCompatibleToolsFromClaude(
         preparedClaudeBody.tools as Record<string, unknown>[],
-        {
-          preserveExisting: preserveCacheControl,
-        }
+        preserveCacheControl
       )
     : buildClaudeCodeCompatibleTools(normalizedBody, sourceBody);
   const toolChoice =
@@ -221,11 +314,75 @@ export function buildClaudeCodeCompatibleRequest({
   };
 }
 
+/**
+ * Full Claude Code request processing pipeline.
+ *
+ * Applies all mechanisms that real Claude Code uses:
+ * 1. Build base request (system prompt, billing header, messages, tools)
+ * 2. Remap tool names to TitleCase
+ * 3. Enforce thinking temperature constraint (temp=1)
+ * 4. Disable thinking when tool_choice forces a specific tool
+ * 5. Enforce 4-block cache_control limit when markers are already present
+ * 6. Obfuscate sensitive words in user messages
+ * 7. Serialize with CCH placeholder
+ * 8. Sign body with xxHash64 CCH attestation
+ *
+ * Returns { bodyString, headers } ready to send upstream.
+ */
+export async function buildAndSignClaudeCodeRequest(
+  options: BuildRequestOptions & { apiKey: string; enableObfuscation?: boolean }
+): Promise<{ bodyString: string; headers: Record<string, string> }> {
+  const { apiKey, enableObfuscation = false, ...buildOptions } = options;
+
+  // Step 1: Build base request
+  const body = buildClaudeCodeCompatibleRequest(buildOptions);
+
+  // Step 2: Remap tool names
+  remapToolNamesInRequest(body);
+
+  // Step 3-4: Thinking constraints
+  enforceThinkingTemperature(body);
+  disableThinkingIfToolChoiceForced(body);
+
+  // Step 5: Cache control
+  enforceCacheControlLimit(body);
+
+  // Step 6: Obfuscation (optional, per-provider setting)
+  if (enableObfuscation) {
+    obfuscateInBody(body);
+  }
+
+  // Step 7: Serialize with CCH placeholder
+  const serialized = JSON.stringify(body);
+
+  // Step 8: Sign with xxHash64
+  const bodyString = await signRequestBody(serialized);
+
+  // Build headers
+  const sessionId = options.sessionId || resolveClaudeCodeCompatibleSessionId();
+  const headers = buildClaudeCodeCompatibleHeaders(apiKey, options.stream ?? false, sessionId);
+
+  return { bodyString, headers };
+}
+
+/**
+ * Re-export for consumers that need to post-process SSE response chunks.
+ */
+export { remapToolNamesInResponse } from "./claudeCodeToolRemapper.ts";
+export { signRequestBody } from "./claudeCodeCCH.ts";
+export { computeFingerprint } from "./claudeCodeFingerprint.ts";
+export { obfuscateSensitiveWords, setSensitiveWords } from "./claudeCodeObfuscation.ts";
+export {
+  enforceThinkingTemperature,
+  disableThinkingIfToolChoiceForced,
+  enforceCacheControlLimit,
+} from "./claudeCodeConstraints.ts";
+
 export function resolveClaudeCodeCompatibleEffort(
   sourceBody?: Record<string, unknown> | null,
   normalizedBody?: Record<string, unknown> | null,
   model?: string | null
-): "low" | "medium" | "high" {
+): "low" | "medium" | "high" | "xhigh" {
   const raw =
     readNestedString(sourceBody, ["output_config", "effort"]) ||
     readNestedString(sourceBody, ["reasoning", "effort"]) ||
@@ -236,14 +393,16 @@ export function resolveClaudeCodeCompatibleEffort(
     "";
 
   const normalizedEffort = raw.toLowerCase();
-  void model;
 
   if (!normalizedEffort) return "high";
   if (normalizedEffort === "low") return "low";
   if (normalizedEffort === "medium") return "medium";
   if (normalizedEffort === "high") return "high";
   if (normalizedEffort === "none" || normalizedEffort === "disabled") return "low";
-  if (normalizedEffort === "max" || normalizedEffort === "xhigh") {
+  if (normalizedEffort === "xhigh") {
+    return supportsClaudeXHighEffort(model) ? "xhigh" : "high";
+  }
+  if (normalizedEffort === "max") {
     return "high";
   }
   return "high";
@@ -278,11 +437,16 @@ function buildClaudeCodeCompatibleMessages(messages: MessageLike[]) {
     .filter(
       (
         message
-      ): message is { role: "user" | "assistant"; content: Array<Record<string, unknown>> } =>
-        !!message && message.content.length > 0
+      ): message is {
+        role: "user" | "assistant";
+        content: Array<{ type: string; text: string }>;
+      } => !!message && message.content.length > 0
     );
 
-  const merged: Array<{ role: "user" | "assistant"; content: Array<Record<string, unknown>> }> = [];
+  const merged: Array<{
+    role: "user" | "assistant";
+    content: Array<{ type: string; text: string }>;
+  }> = [];
 
   for (const message of converted) {
     const last = merged[merged.length - 1];
@@ -312,13 +476,11 @@ function buildClaudeCodeCompatibleMessages(messages: MessageLike[]) {
       return [
         {
           role: "user" as const,
-          content: [{ type: "text", text: fallbackText, cache_control: { type: "ephemeral" } }],
+          content: [{ type: "text", text: fallbackText }],
         },
       ];
     }
   }
-
-  applyClaudeCodeCompatibleMessageCacheStrategy(merged);
 
   return merged;
 }
@@ -358,9 +520,6 @@ function buildClaudeCodeCompatibleMessagesFromClaude(
       stripCacheControlFromContentBlocks(message.content);
     }
   }
-  applyClaudeCodeCompatibleMessageCacheStrategy(merged, {
-    preserveExisting: preserveCacheControl,
-  });
 
   if (merged.length === 0) {
     const fallbackText = converted
@@ -373,7 +532,7 @@ function buildClaudeCodeCompatibleMessagesFromClaude(
       return [
         {
           role: "user" as const,
-          content: [{ type: "text", text: fallbackText, cache_control: { type: "ephemeral" } }],
+          content: [{ type: "text", text: fallbackText }],
         },
       ];
     }
@@ -388,57 +547,42 @@ function buildClaudeCodeCompatibleSystemBlocks({
   cwd,
   now,
   preserveCacheControl,
+  billingHeader,
 }: {
   messages: MessageLike[] | undefined;
   systemBlocks?: Array<Record<string, unknown>> | undefined;
   cwd: string;
   now: Date;
   preserveCacheControl: boolean;
+  billingHeader: string;
 }) {
   const customSystemBlocks =
     Array.isArray(systemBlocks) && systemBlocks.length > 0
       ? systemBlocks.map((block) => ({ ...block }))
       : extractCustomSystemBlocks(messages);
-  const useLongSystemTtl =
-    !preserveCacheControl ||
-    customSystemBlocks.some((block) => readCacheControlTtl(block) === "1h");
-  const systemCacheControl = useLongSystemTtl
-    ? { type: "ephemeral", ttl: "1h" }
-    : { type: "ephemeral" };
 
   const dateText = formatDate(now);
   const blocks: Array<Record<string, unknown>> = [
     {
       type: "text",
-      text: CLAUDE_CODE_COMPATIBLE_BILLING_HEADER,
+      text: billingHeader,
     },
     {
       type: "text",
       text: "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
-      cache_control: { ...systemCacheControl },
     },
     {
       type: "text",
       text: `You are Claude Code, Anthropic's official CLI for Claude.\n\nCWD: ${cwd}\nDate: ${dateText}`,
-      cache_control: { ...systemCacheControl },
     },
   ];
 
   for (const systemBlock of customSystemBlocks) {
-    const preparedBlock = { ...systemBlock };
-    if (!preserveCacheControl || useLongSystemTtl) {
-      preparedBlock.cache_control = { ...systemCacheControl };
+    const preparedBlock = { ...systemBlock } as Record<string, unknown>;
+    if (!preserveCacheControl) {
+      delete preparedBlock["cache_control"];
     }
     blocks.push(preparedBlock);
-  }
-
-  if (
-    preserveCacheControl &&
-    customSystemBlocks.length > 0 &&
-    !customSystemBlocks.some((block) => hasCacheControl(block))
-  ) {
-    const lastCustomSystemBlock = blocks[blocks.length - 1];
-    lastCustomSystemBlock.cache_control = { ...systemCacheControl };
   }
 
   return blocks;
@@ -477,11 +621,22 @@ function buildClaudeCodeCompatibleTools(
   return rawTools
     .map((tool) => convertClaudeCodeCompatibleTool(tool))
     .filter((tool): tool is Record<string, unknown> => !!tool)
-    .map((tool) => ({ ...tool }))
-    .map((tool, index, tools) => {
-      if (index !== findLastCacheableToolIndex(tools)) return tool;
-      return { ...tool, cache_control: { type: "ephemeral", ttl: "1h" } };
-    });
+    .map((tool) => ({ ...tool }));
+}
+
+function buildClaudeCodeCompatibleToolsFromClaude(
+  tools: Record<string, unknown>[] | undefined,
+  preserveCacheControl: boolean
+) {
+  if (!Array.isArray(tools)) return [];
+
+  return tools.map((tool) => {
+    const preparedTool = { ...tool };
+    if (!preserveCacheControl) {
+      delete preparedTool.cache_control;
+    }
+    return preparedTool;
+  });
 }
 
 function convertClaudeCodeCompatibleTool(tool: unknown) {
@@ -546,15 +701,19 @@ function prepareClaudeCodeCompatibleBody(
   claudeBody: Record<string, unknown>,
   preserveCacheControl: boolean
 ) {
+  void preserveCacheControl;
   const prepared = prepareClaudeRequest(
     {
       system: normalizeClaudeSystemInput(claudeBody.system),
-      messages: normalizeClaudeMessageInput(claudeBody.messages),
+      messages: normalizeClaudeMessageInput(claudeBody.messages) as Array<{
+        role?: string;
+        content?: string | Array<Record<string, unknown>>;
+      }>,
       tools: normalizeClaudeToolInput(claudeBody.tools),
-      thinking: readRecord(claudeBody.thinking) || claudeBody.thinking,
+      thinking: (readRecord(claudeBody.thinking) || null) as Record<string, unknown> | null,
     },
     CLAUDE_CODE_COMPATIBLE_PREFIX,
-    preserveCacheControl
+    true
   );
 
   return readRecord(prepared);
@@ -584,7 +743,7 @@ function normalizeClaudeMessageInput(messages: unknown) {
         content: normalizeClaudeContentInput(record.content),
       };
     })
-    .filter((message): message is Record<string, unknown> => !!message);
+    .filter((message): message is Record<string, unknown> & { content: unknown } => !!message);
 }
 
 function normalizeClaudeToolInput(tools: unknown) {
@@ -673,109 +832,10 @@ function extractCustomSystemBlocks(messages: MessageLike[] | undefined) {
     }));
 }
 
-function applyClaudeCodeCompatibleMessageCacheStrategy(
-  messages: Array<{ role: "user" | "assistant"; content: Array<Record<string, unknown>> }>,
-  options: {
-    preserveExisting?: boolean;
-  } = {}
-) {
-  const preserveExisting = options.preserveExisting === true;
-  const userIndexes = messages.reduce((indexes, message, index) => {
-    if (message.role === "user") indexes.push(index);
-    return indexes;
-  }, [] as number[]);
-  const hasAssistant = messages.some((message) => message.role === "assistant");
-  const secondToLastUserIndex = userIndexes.length >= 2 ? userIndexes[userIndexes.length - 2] : -1;
-
-  if (secondToLastUserIndex >= 0) {
-    markLastContentCacheControl(
-      messages[secondToLastUserIndex].content,
-      undefined,
-      preserveExisting
-    );
-  } else if (!hasAssistant && userIndexes.length > 0) {
-    markLastContentCacheControl(
-      messages[userIndexes[userIndexes.length - 1]].content,
-      undefined,
-      preserveExisting
-    );
-  }
-
-  const lastUserIndex = userIndexes.length > 0 ? userIndexes[userIndexes.length - 1] : -1;
-  const endsOnUser = lastUserIndex === messages.length - 1;
-  if (endsOnUser && lastUserIndex >= 0) {
-    markLastContentCacheControl(messages[lastUserIndex].content, undefined, preserveExisting);
-  }
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role !== "assistant") continue;
-    if (markLastContentCacheControl(messages[i].content, undefined, preserveExisting)) break;
-  }
-}
-
 function stripCacheControlFromContentBlocks(content: Array<Record<string, unknown>>) {
   for (const block of content) {
     delete block.cache_control;
   }
-}
-
-function applyClaudeCodeCompatibleToolCacheStrategy(
-  tools: Array<Record<string, unknown>>,
-  options: {
-    preserveExisting?: boolean;
-  } = {}
-) {
-  const preparedTools = tools.map((tool) => ({ ...tool }));
-  const lastCacheableToolIndex = findLastCacheableToolIndex(preparedTools);
-  if (lastCacheableToolIndex < 0) return preparedTools;
-
-  if (options.preserveExisting && preparedTools.some((tool) => hasCacheControl(tool))) {
-    return preparedTools;
-  }
-
-  preparedTools[lastCacheableToolIndex].cache_control = { type: "ephemeral", ttl: "1h" };
-  return preparedTools;
-}
-
-function markLastContentCacheControl(
-  content: Array<Record<string, unknown>>,
-  ttl?: string,
-  preserveExisting = false
-) {
-  if (!Array.isArray(content) || content.length === 0) return false;
-  const lastBlock = content[content.length - 1];
-  if (!lastBlock) return false;
-  if (
-    preserveExisting &&
-    content.some(
-      (block) =>
-        !!block &&
-        typeof block === "object" &&
-        !!readRecord(block)?.cache_control &&
-        typeof readRecord(block)?.cache_control === "object"
-    )
-  ) {
-    return true;
-  }
-  lastBlock.cache_control = ttl ? { type: "ephemeral", ttl } : { type: "ephemeral" };
-  return true;
-}
-
-function hasCacheControl(value: unknown) {
-  return !!readRecord(value)?.cache_control && typeof readRecord(value)?.cache_control === "object";
-}
-
-function readCacheControlTtl(value: unknown) {
-  return toNonEmptyString(readRecord(readRecord(value)?.cache_control)?.ttl);
-}
-
-function findLastCacheableToolIndex(tools: Array<Record<string, unknown>>) {
-  for (let i = tools.length - 1; i >= 0; i--) {
-    if (!tools[i].defer_loading) {
-      return i;
-    }
-  }
-  return -1;
 }
 
 function cloneValue<T>(value: T): T {

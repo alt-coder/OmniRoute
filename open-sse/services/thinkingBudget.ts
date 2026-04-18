@@ -13,8 +13,12 @@ export const ThinkingMode = {
   ADAPTIVE: "adaptive", // Scale based on request complexity
 };
 
-import { capThinkingBudget, getDefaultThinkingBudget } from "@/shared/constants/modelSpecs";
-import { supportsReasoning } from "./modelCapabilities.ts";
+import {
+  capThinkingBudget,
+  getDefaultThinkingBudget,
+  getResolvedModelCapabilities,
+  supportsReasoning,
+} from "@/lib/modelCapabilities";
 
 // Effort → budget token mapping
 export const EFFORT_BUDGETS = {
@@ -155,7 +159,8 @@ export function applyThinkingBudget(body, config = null) {
   // Early exit: strip ALL reasoning/thinking params for models that don't support them.
   // Sending thinking params to unsupported models (e.g. AG claude-sonnet-4-6) causes 400 errors.
   const modelStr = typeof body.model === "string" ? body.model : "";
-  if (modelStr && !supportsReasoning(modelStr)) {
+  const isClaude = modelStr.toLowerCase().includes("claude");
+  if (modelStr && (!supportsReasoning(modelStr) || (!isClaude && modelStr.includes("gemini")))) {
     return stripThinkingConfig(body);
   }
 
@@ -289,6 +294,9 @@ function applyAdaptiveBudget(body, cfg) {
  */
 export function hasThinkingCapableModel(body) {
   const model = body.model || "";
+  const resolved = getResolvedModelCapabilities(model);
+  if (resolved.supportsThinking === true) return true;
+  if (resolved.supportsThinking === false) return false;
   return (
     model.includes("claude") ||
     model.includes("o1") ||

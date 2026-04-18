@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useTranslations } from "next-intl";
 import Card from "./Card";
 import RequestLoggerDetail from "./RequestLoggerDetail";
 import { copyToClipboard } from "@/shared/utils/clipboard";
@@ -28,19 +29,21 @@ const STATUS_FILTERS = [
 // Column definitions for visibility toggles
 const COLUMNS = [
   { key: "status", label: "Status" },
+  { key: "cacheSource", label: "Cache Source" },
   { key: "model", label: "Model" },
   { key: "requestedModel", label: "Requested" },
   { key: "provider", label: "Provider" },
-  { key: "protocol", label: "Protocol" },
+  { key: "protocol", label: "Req Protocol" },
   { key: "account", label: "Account" },
   { key: "apiKey", label: "API Key" },
   { key: "combo", label: "Combo" },
   { key: "tokens", label: "Tokens" },
+  { key: "tps", label: "TPS" },
   { key: "duration", label: "Duration" },
   { key: "time", label: "Time" },
 ];
 
-const DEFAULT_VISIBLE = Object.fromEntries(COLUMNS.map((c) => [c.key, true]));
+// Default visible columns will be generated dynamically with translations
 
 /**
  * Get a friendly display label for compatible providers.
@@ -79,7 +82,70 @@ function getLogTotalTokens(log) {
   return (log?.tokens?.in || 0) + (log?.tokens?.out || 0);
 }
 
+function getLogTps(log): number {
+  const tokensOut = log?.tokens?.out || 0;
+  const durationMs = log?.duration || 0;
+  if (tokensOut <= 0 || durationMs <= 0) return 0;
+  return tokensOut / (durationMs / 1000);
+}
+
+function formatTps(tps: number): string {
+  if (tps <= 0) return "—";
+  if (tps >= 100) return Math.round(tps).toLocaleString();
+  return tps.toFixed(1);
+}
+
+function getCacheSourceMeta(cacheSource: unknown) {
+  if (cacheSource === "semantic") {
+    return {
+      label: "SEM",
+      title: "Semantic cache hit (served by OmniRoute)",
+      className:
+        "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30",
+    };
+  }
+
+  return {
+    label: "UP",
+    title: "Upstream provider response",
+    className: "bg-sky-500/15 text-sky-700 dark:text-sky-300 border border-sky-500/30",
+  };
+}
+
 export default function RequestLoggerV2() {
+  const t = useTranslations("requestLogger");
+
+  // Get translated status filters
+  const statusFilters = useMemo(
+    () => [
+      { key: "all", label: t("statusFilters.all"), icon: "" },
+      { key: "error", label: t("statusFilters.error"), icon: "error" },
+      { key: "ok", label: t("statusFilters.success"), icon: "check_circle" },
+      { key: "combo", label: t("statusFilters.combo"), icon: "hub" },
+    ],
+    [t]
+  );
+
+  // Get translated columns
+  const columns = useMemo(
+    () => [
+      { key: "status", label: t("columns.status") },
+      { key: "cacheSource", label: t("columns.cacheSource") },
+      { key: "model", label: t("columns.model") },
+      { key: "requestedModel", label: t("columns.requested") },
+      { key: "provider", label: t("columns.provider") },
+      { key: "protocol", label: t("columns.protocol") },
+      { key: "account", label: t("columns.account") },
+      { key: "apiKey", label: t("columns.apiKey") },
+      { key: "combo", label: t("columns.combo") },
+      { key: "tokens", label: t("columns.tokens") },
+      { key: "tps", label: t("columns.tps") },
+      { key: "duration", label: t("columns.duration") },
+      { key: "time", label: t("columns.time") },
+    ],
+    [t]
+  );
+
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [recording, setRecording] = useState(true);
@@ -101,12 +167,13 @@ export default function RequestLoggerV2() {
 
   // Column visibility with localStorage persistence
   const [visibleColumns, setVisibleColumns] = useState(() => {
-    if (typeof window === "undefined") return DEFAULT_VISIBLE;
+    const defaultVisible = Object.fromEntries(columns.map((c) => [c.key, true]));
+    if (typeof window === "undefined") return defaultVisible;
     try {
       const saved = localStorage.getItem("loggerVisibleColumns");
-      return saved ? { ...DEFAULT_VISIBLE, ...JSON.parse(saved) } : DEFAULT_VISIBLE;
+      return saved ? { ...defaultVisible, ...JSON.parse(saved) } : defaultVisible;
     } catch {
-      return DEFAULT_VISIBLE;
+      return defaultVisible;
     }
   });
 
@@ -207,6 +274,10 @@ export default function RequestLoggerV2() {
           return (b.duration || 0) - (a.duration || 0);
         case "duration_asc":
           return (a.duration || 0) - (b.duration || 0);
+        case "tps_desc":
+          return getLogTps(b) - getLogTps(a);
+        case "tps_asc":
+          return getLogTps(a) - getLogTps(b);
         case "status_desc":
           return (b.status || 0) - (a.status || 0);
         case "status_asc":
@@ -301,7 +372,7 @@ export default function RequestLoggerV2() {
           <span
             className={`w-2 h-2 rounded-full ${recording ? "bg-red-500 animate-pulse" : "bg-text-muted"}`}
           />
-          {recording ? "Recording" : "Paused"}
+          {recording ? t("recording") : t("paused")}
         </button>
 
         <button
@@ -318,10 +389,10 @@ export default function RequestLoggerV2() {
             className={`w-2 h-2 rounded-full ${detailLoggingEnabled ? "bg-amber-500" : "bg-text-muted"}`}
           />
           {detailLoggingLoading
-            ? "Updating pipeline logs..."
+            ? t("updatingPipelineLogs")
             : detailLoggingEnabled
-              ? "Pipeline Logs On"
-              : "Pipeline Logs Off"}
+              ? t("pipelineLogsOn")
+              : t("pipelineLogsOff")}
         </button>
 
         {/* Search */}
@@ -331,7 +402,7 @@ export default function RequestLoggerV2() {
           </span>
           <input
             type="text"
-            placeholder="Search model, provider, account, API key, combo..."
+            placeholder={t("searchPlaceholder")}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full pl-10 pr-4 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:border-primary"
@@ -344,7 +415,7 @@ export default function RequestLoggerV2() {
           onChange={(e) => setSelectedProvider(e.target.value)}
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[140px]"
         >
-          <option value="">All Providers</option>
+          <option value="">{t("allProviders")}</option>
           {uniqueProviders.map((p) => {
             const compatLabel = getProviderDisplayLabel(p, providerNodes);
             const pc = PROVIDER_COLORS[p];
@@ -362,7 +433,7 @@ export default function RequestLoggerV2() {
           onChange={(e) => setSelectedModel(e.target.value)}
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[180px]"
         >
-          <option value="">All Models</option>
+          <option value="">{t("allModels")}</option>
           {uniqueModels.map((model) => (
             <option key={model} value={model}>
               {model}
@@ -376,7 +447,7 @@ export default function RequestLoggerV2() {
           onChange={(e) => setSelectedAccount(e.target.value)}
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[140px]"
         >
-          <option value="">All Accounts</option>
+          <option value="">{t("allAccounts")}</option>
           {uniqueAccounts.map((a) => (
             <option key={a} value={a}>
               {a}
@@ -390,7 +461,7 @@ export default function RequestLoggerV2() {
           onChange={(e) => setSelectedApiKey(e.target.value)}
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[160px]"
         >
-          <option value="">All API Keys</option>
+          <option value="">{t("allApiKeys")}</option>
           {uniqueApiKeys.map((value) => {
             const matched = logs.find((l) => (l.apiKeyId || l.apiKeyName) === value);
             const label = formatApiKeyLabel(matched?.apiKeyName, matched?.apiKeyId);
@@ -405,28 +476,28 @@ export default function RequestLoggerV2() {
         {/* Stats */}
         <div className="flex items-center gap-2 text-xs text-text-muted">
           <span className="px-2 py-1 rounded bg-bg-subtle border border-border font-mono">
-            {totalCount} total
+            {totalCount} {t("total")}
           </span>
           <span className="px-2 py-1 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 font-mono">
-            {okCount} OK
+            {okCount} {t("ok")}
           </span>
           {errorCount > 0 && (
             <span className="px-2 py-1 rounded bg-red-500/10 text-red-700 dark:text-red-400 font-mono">
-              {errorCount} ERR
+              {errorCount} {t("err")}
             </span>
           )}
           {comboCount > 0 && (
             <span className="px-2 py-1 rounded bg-violet-500/10 text-violet-700 dark:text-violet-400 font-mono">
-              {comboCount} combo
+              {comboCount} {t("combo")}
             </span>
           )}
           {apiKeyCount > 0 && (
             <span className="px-2 py-1 rounded bg-primary/10 text-primary font-mono">
-              {apiKeyCount} keys
+              {apiKeyCount} {t("keys")}
             </span>
           )}
           <span className="px-2 py-1 rounded bg-bg-subtle border border-border font-mono">
-            {sortedLogs.length} shown
+            {sortedLogs.length} {t("shown")}
           </span>
         </div>
 
@@ -437,16 +508,16 @@ export default function RequestLoggerV2() {
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[150px]"
           title="Sort logs"
         >
-          <option value="newest">Newest</option>
-          <option value="oldest">Oldest</option>
-          <option value="tokens_desc">Tokens ↓</option>
-          <option value="tokens_asc">Tokens ↑</option>
-          <option value="duration_desc">Duration ↓</option>
-          <option value="duration_asc">Duration ↑</option>
-          <option value="status_desc">Status ↓</option>
-          <option value="status_asc">Status ↑</option>
-          <option value="model_asc">Model A-Z</option>
-          <option value="model_desc">Model Z-A</option>
+          <option value="newest">{t("sortNewest")}</option>
+          <option value="oldest">{t("sortOldest")}</option>
+          <option value="tokens_desc">{t("sortTokensDesc")}</option>
+          <option value="tokens_asc">{t("sortTokensAsc")}</option>
+          <option value="duration_desc">{t("sortDurationDesc")}</option>
+          <option value="duration_asc">{t("sortDurationAsc")}</option>
+          <option value="status_desc">{t("sortStatusDesc")}</option>
+          <option value="status_asc">{t("sortStatusAsc")}</option>
+          <option value="model_asc">{t("sortModelAsc")}</option>
+          <option value="model_desc">{t("sortModelDesc")}</option>
         </select>
 
         {/* Refresh */}
@@ -462,7 +533,7 @@ export default function RequestLoggerV2() {
       {/* Quick Filters */}
       <div className="flex flex-wrap items-center gap-2">
         {/* Status Filters */}
-        {STATUS_FILTERS.map((f) => (
+        {statusFilters.map((f) => (
           <button
             key={f.key}
             onClick={() => setActiveFilter(activeFilter === f.key ? "all" : f.key)}
@@ -519,7 +590,7 @@ export default function RequestLoggerV2() {
       {/* Column Visibility Toggles */}
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="text-[10px] text-text-muted uppercase tracking-wider mr-1">Columns</span>
-        {COLUMNS.map((col) => (
+        {columns.map((col) => (
           <button
             key={col.key}
             onClick={() => toggleColumn(col.key)}
@@ -538,18 +609,16 @@ export default function RequestLoggerV2() {
       <Card className="overflow-hidden bg-black/5 dark:bg-black/20">
         <div className="p-0 overflow-x-auto max-h-[calc(100vh-320px)] overflow-y-auto">
           {loading && logs.length === 0 ? (
-            <div className="p-8 text-center text-text-muted">Loading logs...</div>
+            <div className="p-8 text-center text-text-muted">{t("loadingLogs")}</div>
           ) : logs.length === 0 ? (
             <div className="p-8 text-center text-text-muted">
               <span className="material-symbols-outlined text-[48px] mb-2 block opacity-40">
                 receipt_long
               </span>
-              No logs recorded yet. Make some API calls to see them here.
+              {t("noLogs")}
             </div>
           ) : sortedLogs.length === 0 ? (
-            <div className="p-8 text-center text-text-muted">
-              No logs match the current filters.
-            </div>
+            <div className="p-8 text-center text-text-muted">{t("noMatchingLogs")}</div>
           ) : (
             <table className="w-full text-left border-collapse text-xs">
               <thead
@@ -562,57 +631,67 @@ export default function RequestLoggerV2() {
                 >
                   {visibleColumns.status && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Status
+                      {t("columns.status")}
+                    </th>
+                  )}
+                  {visibleColumns.cacheSource && (
+                    <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
+                      {t("columns.cacheSource")}
                     </th>
                   )}
                   {visibleColumns.model && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Model
+                      {t("columns.model")}
                     </th>
                   )}
                   {visibleColumns.requestedModel && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Requested
+                      {t("columns.requested")}
                     </th>
                   )}
                   {visibleColumns.provider && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Provider
+                      {t("columns.provider")}
                     </th>
                   )}
                   {visibleColumns.protocol && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Protocol
+                      {t("columns.protocol")}
                     </th>
                   )}
                   {visibleColumns.account && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Account
+                      {t("columns.account")}
                     </th>
                   )}
                   {visibleColumns.apiKey && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      API Key
+                      {t("columns.apiKey")}
                     </th>
                   )}
                   {visibleColumns.combo && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Combo
+                      {t("columns.combo")}
                     </th>
                   )}
                   {visibleColumns.tokens && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
-                      Tokens
+                      {t("columns.tokens")}
+                    </th>
+                  )}
+                  {visibleColumns.tps && (
+                    <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
+                      {t("columns.tps")}
                     </th>
                   )}
                   {visibleColumns.duration && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
-                      Duration
+                      {t("columns.duration")}
                     </th>
                   )}
                   {visibleColumns.time && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
-                      Time
+                      {t("columns.time")}
                     </th>
                   )}
                 </tr>
@@ -635,6 +714,7 @@ export default function RequestLoggerV2() {
                   };
                   const providerLabel = compatLabel || providerColor.label;
                   const isError = log.status >= 400;
+                  const cacheSourceMeta = getCacheSourceMeta(log.cacheSource);
 
                   return (
                     <tr
@@ -649,6 +729,16 @@ export default function RequestLoggerV2() {
                             style={{ backgroundColor: statusStyle.bg, color: statusStyle.text }}
                           >
                             {log.status || "..."}
+                          </span>
+                        </td>
+                      )}
+                      {visibleColumns.cacheSource && (
+                        <td className="px-3 py-2">
+                          <span
+                            className={`inline-block px-2 py-0.5 rounded text-[9px] font-bold uppercase ${cacheSourceMeta.className}`}
+                            title={cacheSourceMeta.title}
+                          >
+                            {cacheSourceMeta.label === "SEM" ? "Semantic" : "Upstream"}
                           </span>
                         </td>
                       )}
@@ -728,15 +818,35 @@ export default function RequestLoggerV2() {
                       )}
                       {visibleColumns.tokens && (
                         <td className="px-3 py-2 text-right whitespace-nowrap">
-                          <span className="text-text-muted">I:</span>{" "}
+                          <span className="text-text-muted">TI:</span>{" "}
                           <span className="text-primary">
                             {log.tokens?.in?.toLocaleString() || 0}
                           </span>
                           <span className="mx-1 text-border">|</span>
-                          <span className="text-text-muted">O:</span>{" "}
+                          <span className="text-text-muted">TO:</span>{" "}
                           <span className="text-emerald-700 dark:text-emerald-400">
                             {log.tokens?.out?.toLocaleString() || 0}
                           </span>
+                        </td>
+                      )}
+                      {visibleColumns.tps && (
+                        <td className="px-3 py-2 text-right whitespace-nowrap font-mono">
+                          {(() => {
+                            const tps = getLogTps(log);
+                            const color =
+                              tps <= 0
+                                ? "text-text-muted"
+                                : tps >= 80
+                                  ? "text-emerald-600 dark:text-emerald-400"
+                                  : tps >= 30
+                                    ? "text-sky-600 dark:text-sky-400"
+                                    : "text-amber-600 dark:text-amber-400";
+                            return (
+                              <span className={color} title={`${tps.toFixed(2)} tokens/sec`}>
+                                {formatTps(tps)}
+                              </span>
+                            );
+                          })()}
                         </td>
                       )}
                       {visibleColumns.duration && (
@@ -759,8 +869,11 @@ export default function RequestLoggerV2() {
       </Card>
 
       <div className="text-[10px] text-text-muted italic">
-        Call logs are also saved as JSON files to <code>{`{DATA_DIR}/call_logs/`}</code> and rotated
-        by <code>CALL_LOG_RETENTION_DAYS</code> and <code>CALL_LOG_MAX_ENTRIES</code>.
+        {t("callLogsInfo", {
+          dataDir: "{DATA_DIR}/call_logs/",
+          retentionDays: "CALL_LOG_RETENTION_DAYS",
+          maxEntries: "CALL_LOG_MAX_ENTRIES",
+        })}
       </div>
 
       {/* Detail Modal */}

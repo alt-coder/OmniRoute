@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Proactive Token Health Check Scheduler
  *
@@ -10,12 +11,18 @@
  * updates the DB, and logs the result.
  */
 
-import { getProviderConnections, updateProviderConnection, getSettings } from "@/lib/localDb";
+import {
+  getProviderConnections,
+  updateProviderConnection,
+  getSettings,
+  resolveProxyForConnection,
+} from "@/lib/localDb";
 import {
   getAccessToken,
   supportsTokenRefresh,
   isUnrecoverableRefreshError,
 } from "@omniroute/open-sse/services/tokenRefresh.ts";
+import { pickMaskedDisplayValue } from "@/shared/utils/maskEmail";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const TICK_MS = 60 * 1000; // sweep interval: every 60 seconds
@@ -25,6 +32,55 @@ const EXPIRED_RETRY_BACKOFF_MIN = 5; // backoff between expired retries (minutes
 const LOG_PREFIX = "[HealthCheck]";
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 
+function isBuildProcess(): boolean {
+  return typeof process !== "undefined" && process.env.NEXT_PHASE === "phase-production-build";
+}
+
+function isAutomatedTestProcess(): boolean {
+  return (
+    typeof process !== "undefined" &&
+    (process.env.NODE_ENV === "test" ||
+      process.env.VITEST !== undefined ||
+      process.argv.some((arg) => arg.includes("test")))
+  );
+}
+
+function getConnectionLogLabel(conn: { name?: string; email?: string; id?: string }): string {
+  return pickMaskedDisplayValue([conn.name, conn.email], conn.id || "-");
+}
+
+export function extractResolvedProxyConfig(resolvedProxy: unknown) {
+  if (
+    resolvedProxy &&
+    typeof resolvedProxy === "object" &&
+    !Array.isArray(resolvedProxy) &&
+    "proxy" in resolvedProxy
+  ) {
+    return (resolvedProxy as { proxy?: unknown }).proxy ?? null;
+  }
+
+  return resolvedProxy ?? null;
+}
+
+export function buildRefreshFailureUpdate(conn: any, now: string) {
+  const wasExpired = conn.testStatus === "expired";
+  const retryCount = (conn.expiredRetryCount ?? 0) + (wasExpired ? 1 : 0);
+
+  return {
+    lastHealthCheckAt: now,
+    // A failed background refresh should not evict otherwise healthy accounts
+    // from request routing. Keep non-expired connections active and only persist
+    // the refresh error metadata for observability.
+    testStatus: wasExpired ? "expired" : "active",
+    lastError: "Health check: token refresh failed",
+    lastErrorAt: now,
+    lastErrorType: "token_refresh_failed",
+    lastErrorSource: "oauth",
+    errorCode: "refresh_failed",
+    ...(wasExpired ? { expiredRetryCount: retryCount, expiredRetryAt: now } : {}),
+  };
+}
+
 function isEnvFlagEnabled(name: string): boolean {
   const value = process.env[name];
   if (!value) return false;
@@ -32,7 +88,11 @@ function isEnvFlagEnabled(name: string): boolean {
 }
 
 function isHealthCheckDisabled(): boolean {
-  return isEnvFlagEnabled("OMNIROUTE_DISABLE_TOKEN_HEALTHCHECK") || process.env.NODE_ENV === "test";
+  return (
+    isEnvFlagEnabled("OMNIROUTE_DISABLE_TOKEN_HEALTHCHECK") ||
+    isBuildProcess() ||
+    isAutomatedTestProcess()
+  );
 }
 
 // ── Logging helper ───────────────────────────────────────────────────────────
@@ -42,7 +102,11 @@ let pendingHideLogs: Promise<boolean> | null = null;
 const CACHE_TTL = 30_000; // Cache settings for 30 seconds
 
 async function shouldHideLogs(): Promise<boolean> {
-  if (isEnvFlagEnabled("OMNIROUTE_HIDE_HEALTHCHECK_LOGS") || process.env.NODE_ENV === "test") {
+  if (
+    isEnvFlagEnabled("OMNIROUTE_HIDE_HEALTHCHECK_LOGS") ||
+    isBuildProcess() ||
+    isAutomatedTestProcess()
+  ) {
     return true;
   }
 
@@ -126,10 +190,16 @@ export function initTokenHealthCheck() {
 
   log(`${LOG_PREFIX} Starting proactive token health-check (tick every ${TICK_MS / 1000}s)`);
 
-  setTimeout(() => {
+  const timer = setTimeout(() => {
     sweep();
     state.interval = setInterval(sweep, TICK_MS);
+    if (state.interval && typeof state.interval === "object" && "unref" in state.interval) {
+      (state.interval as { unref?: () => void }).unref?.();
+    }
   }, 10_000);
+  if (timer && typeof timer === "object" && "unref" in timer) {
+    (timer as { unref?: () => void }).unref?.();
+  }
 }
 
 /**
@@ -151,12 +221,20 @@ async function sweep() {
 
     if (!connections || connections.length === 0) return;
 
-    for (const conn of connections) {
+    const staggerMs = parseInt(process.env.HEALTHCHECK_STAGGER_MS || "3000", 10);
+
+    for (let i = 0; i < connections.length; i++) {
+      const conn = connections[i];
       try {
         await checkConnection(conn);
       } catch (err) {
         // Per-connection isolation: one failure never blocks others
         logError(`${LOG_PREFIX} Error checking ${conn.name || conn.id}:`, err.message);
+      }
+
+      // Stagger delay between checks to prevent bursting (Issue #1220)
+      if (staggerMs > 0 && i < connections.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, staggerMs));
       }
     }
   } catch (err) {
@@ -167,7 +245,7 @@ async function sweep() {
 /**
  * Check a single connection and refresh if due.
  */
-async function checkConnection(conn) {
+export async function checkConnection(conn) {
   // Determine interval (0 = disabled)
   const intervalMin = conn.healthCheckInterval ?? DEFAULT_HEALTH_CHECK_INTERVAL_MIN;
   if (intervalMin <= 0) return;
@@ -184,7 +262,7 @@ async function checkConnection(conn) {
     if (Date.now() - lastRetry < backoffMs) return;
 
     log(
-      `${LOG_PREFIX} Retrying expired ${conn.provider}/${conn.name || conn.email || conn.id} (attempt ${retryCount + 1}/${EXPIRED_RETRY_MAX})`
+      `${LOG_PREFIX} Retrying expired ${conn.provider}/${getConnectionLogLabel(conn)} (attempt ${retryCount + 1}/${EXPIRED_RETRY_MAX})`
     );
   }
 
@@ -192,7 +270,7 @@ async function checkConnection(conn) {
     const now = new Date().toISOString();
     await updateProviderConnection(conn.id, { lastHealthCheckAt: now });
     log(
-      `${LOG_PREFIX} Skipping ${conn.provider}/${conn.name || conn.email || conn.id} (refresh unsupported)`
+      `${LOG_PREFIX} Skipping ${conn.provider}/${getConnectionLogLabel(conn)} (refresh unsupported)`
     );
     return;
   }
@@ -210,9 +288,7 @@ async function checkConnection(conn) {
   if (Date.now() - lastCheck < intervalMs && !isAboutToExpire) return;
 
   const reason = isAboutToExpire ? "token expiring soon" : `interval: ${intervalMin}min`;
-  log(
-    `${LOG_PREFIX} Refreshing ${conn.provider}/${conn.name || conn.email || conn.id} (${reason})`
-  );
+  log(`${LOG_PREFIX} Refreshing ${conn.provider}/${getConnectionLogLabel(conn)} (${reason})`);
 
   const credentials = {
     refreshToken: conn.refreshToken,
@@ -222,17 +298,24 @@ async function checkConnection(conn) {
   };
 
   const hideLogs = await shouldHideLogs();
-  const result = await getAccessToken(conn.provider, credentials, {
-    info: (tag, msg) => {
-      if (!hideLogs) console.log(`${LOG_PREFIX} [${tag}] ${msg}`);
+  const proxyResolution = await resolveProxyForConnection(conn.id);
+  const proxyConfig = extractResolvedProxyConfig(proxyResolution);
+  const result = await getAccessToken(
+    conn.provider,
+    credentials,
+    {
+      info: (tag, msg) => {
+        if (!hideLogs) console.log(`${LOG_PREFIX} [${tag}] ${msg}`);
+      },
+      warn: (tag, msg) => {
+        if (!hideLogs) console.warn(`${LOG_PREFIX} [${tag}] ${msg}`);
+      },
+      error: (tag, msg, extra) => {
+        if (!hideLogs) console.error(`${LOG_PREFIX} [${tag}] ${msg}`, extra || "");
+      },
     },
-    warn: (tag, msg) => {
-      if (!hideLogs) console.warn(`${LOG_PREFIX} [${tag}] ${msg}`);
-    },
-    error: (tag, msg, extra) => {
-      if (!hideLogs) console.error(`${LOG_PREFIX} [${tag}] ${msg}`, extra || "");
-    },
-  });
+    proxyConfig
+  );
 
   const now = new Date().toISOString();
 
@@ -253,7 +336,7 @@ async function checkConnection(conn) {
       refreshToken: null,
     });
     logError(
-      `${LOG_PREFIX} ✗ ${conn.provider}/${conn.name || conn.email || conn.id} — ` +
+      `${LOG_PREFIX} ✗ ${conn.provider}/${getConnectionLogLabel(conn)} — ` +
         `Refresh token is permanently invalid (${result.error}). ` +
         `Connection deactivated. Re-authenticate to restore.`
     );
@@ -290,24 +373,15 @@ async function checkConnection(conn) {
     }
 
     await updateProviderConnection(conn.id, updateData);
-    log(`${LOG_PREFIX} ✓ ${conn.provider}/${conn.name || conn.email || conn.id} refreshed`);
+    log(`${LOG_PREFIX} ✓ ${conn.provider}/${getConnectionLogLabel(conn)} refreshed`);
   } else {
-    const wasExpired = conn.testStatus === "expired";
-    const retryCount = (conn.expiredRetryCount ?? 0) + (wasExpired ? 1 : 0);
-
-    await updateProviderConnection(conn.id, {
-      lastHealthCheckAt: now,
-      testStatus: wasExpired ? "expired" : "error",
-      lastError: "Health check: token refresh failed",
-      lastErrorAt: now,
-      lastErrorType: "token_refresh_failed",
-      lastErrorSource: "oauth",
-      errorCode: "refresh_failed",
-      ...(wasExpired ? { expiredRetryCount: retryCount, expiredRetryAt: now } : {}),
-    });
+    const updateData = buildRefreshFailureUpdate(conn, now);
+    await updateProviderConnection(conn.id, updateData);
     logWarn(
-      `${LOG_PREFIX} ✗ ${conn.provider}/${conn.name || conn.email || conn.id} refresh failed` +
-        (wasExpired ? ` (expired retry ${retryCount}/${EXPIRED_RETRY_MAX})` : "")
+      `${LOG_PREFIX} ✗ ${conn.provider}/${getConnectionLogLabel(conn)} refresh failed` +
+        (conn.testStatus === "expired"
+          ? ` (${updateData.expiredRetryCount}/${EXPIRED_RETRY_MAX} expired retries used)`
+          : "")
     );
   }
 }

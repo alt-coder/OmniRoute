@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
+import { useTranslations } from "next-intl";
 import Modal from "./Modal";
 import Button from "./Button";
 import Input from "./Input";
@@ -11,6 +12,7 @@ import Input from "./Input";
  * Auto-detect and import token from Cursor IDE's local SQLite database
  */
 export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
+  const t = useTranslations("cursorAuthModal");
   const [accessToken, setAccessToken] = useState("");
   const [machineId, setMachineId] = useState("");
   const [error, setError] = useState(null);
@@ -33,13 +35,13 @@ export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
 
         if (data.found) {
           setAccessToken(data.accessToken);
-          setMachineId(data.machineId);
+          setMachineId(data.machineId || "");
           setAutoDetected(true);
         } else {
-          setError(data.error || "Could not auto-detect tokens");
+          setError(data.error || t("errorAutoDetect"));
         }
       } catch (err) {
-        setError("Failed to auto-detect tokens");
+        setError(t("errorAutoDetectFailed"));
       } finally {
         setAutoDetecting(false);
       }
@@ -50,12 +52,7 @@ export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
 
   const handleImportToken = async () => {
     if (!accessToken.trim()) {
-      setError("Please enter an access token");
-      return;
-    }
-
-    if (!machineId.trim()) {
-      setError("Please enter a machine ID");
+      setError(t("errorEnterToken"));
       return;
     }
 
@@ -63,19 +60,19 @@ export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
     setError(null);
 
     try {
+      const body: Record<string, string> = { accessToken: accessToken.trim() };
+      if (machineId.trim()) body.machineId = machineId.trim();
+
       const res = await fetch("/api/oauth/cursor/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          accessToken: accessToken.trim(),
-          machineId: machineId.trim(),
-        }),
+        body: JSON.stringify(body),
       });
 
       const data = await res.json();
 
       if (!res.ok) {
-        throw new Error(data.error || "Import failed");
+        throw new Error(data.error || t("errorImportFailed"));
       }
 
       // Success - close modal and trigger refresh
@@ -89,7 +86,7 @@ export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
   };
 
   return (
-    <Modal isOpen={isOpen} title="Connect Cursor IDE" onClose={onClose}>
+    <Modal isOpen={isOpen} title={t("title")} onClose={onClose}>
       <div className="flex flex-col gap-4">
         {/* Auto-detecting state */}
         {autoDetecting && (
@@ -99,8 +96,8 @@ export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
                 progress_activity
               </span>
             </div>
-            <h3 className="text-lg font-semibold mb-2">Auto-detecting tokens...</h3>
-            <p className="text-sm text-text-muted">Reading from Cursor IDE database</p>
+            <h3 className="text-lg font-semibold mb-2">{t("autoDetecting")}</h3>
+            <p className="text-sm text-text-muted">{t("readingFromCursor")}</p>
           </div>
         )}
 
@@ -115,7 +112,7 @@ export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
                     check_circle
                   </span>
                   <p className="text-sm text-green-800 dark:text-green-200">
-                    Tokens auto-detected from Cursor IDE successfully!
+                    {t("tokensAutoDetected")}
                   </p>
                 </div>
               </div>
@@ -129,7 +126,7 @@ export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
                     info
                   </span>
                   <p className="text-sm text-blue-800 dark:text-blue-200">
-                    Cursor IDE not detected. Please paste your tokens manually.
+                    {t("cursorNotDetected")}
                   </p>
                 </div>
               </div>
@@ -138,26 +135,26 @@ export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
             {/* Access Token Input */}
             <div>
               <label className="block text-sm font-medium mb-2">
-                Access Token <span className="text-red-500">*</span>
+                {t("accessToken")} <span className="text-red-500">{t("required")}</span>
               </label>
               <textarea
                 value={accessToken}
                 onChange={(e) => setAccessToken(e.target.value)}
-                placeholder="Access token will be auto-filled..."
+                placeholder={t("accessTokenPlaceholder")}
                 rows={3}
                 className="w-full px-3 py-2 text-sm font-mono border border-border rounded-lg bg-background focus:outline-none focus:border-primary resize-none"
               />
             </div>
 
-            {/* Machine ID Input */}
+            {/* Machine ID Input (optional — not needed for cursor-agent imports) */}
             <div>
               <label className="block text-sm font-medium mb-2">
-                Machine ID <span className="text-red-500">*</span>
+                {t("machineId")} <span className="text-text-muted text-xs">{t("optional")}</span>
               </label>
               <Input
                 value={machineId}
                 onChange={(e) => setMachineId(e.target.value)}
-                placeholder="Machine ID will be auto-filled..."
+                placeholder={t("machineIdPlaceholder")}
                 className="font-mono text-sm"
               />
             </div>
@@ -174,12 +171,12 @@ export default function CursorAuthModal({ isOpen, onSuccess, onClose }) {
               <Button
                 onClick={handleImportToken}
                 fullWidth
-                disabled={importing || !accessToken.trim() || !machineId.trim()}
+                disabled={importing || !accessToken.trim()}
               >
-                {importing ? "Importing..." : "Import Token"}
+                {importing ? t("importing") : t("importToken")}
               </Button>
               <Button onClick={onClose} variant="ghost" fullWidth>
-                Cancel
+                {t("cancel")}
               </Button>
             </div>
           </>

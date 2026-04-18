@@ -30,8 +30,15 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
       output_tokens,
       total_tokens: u.total_tokens ?? input_tokens + output_tokens,
     };
-    if (u.prompt_tokens_details?.cached_tokens) {
-      state.usage.input_tokens_details = { cached_tokens: u.prompt_tokens_details.cached_tokens };
+    const cachedTokens =
+      u.input_tokens_details?.cached_tokens ?? u.prompt_tokens_details?.cached_tokens;
+    if (cachedTokens) {
+      state.usage.input_tokens_details = { cached_tokens: cachedTokens };
+    }
+    const reasoningTokens =
+      u.output_tokens_details?.reasoning_tokens ?? u.completion_tokens_details?.reasoning_tokens;
+    if (reasoningTokens) {
+      state.usage.output_tokens_details = { reasoning_tokens: reasoningTokens };
     }
   }
 
@@ -425,6 +432,31 @@ function flushEvents(state) {
   return events;
 }
 
+function normalizeUpstreamFailure(data, fallbackType = "server_error") {
+  const response = data?.response && typeof data.response === "object" ? data.response : null;
+  const error =
+    response?.error && typeof response.error === "object"
+      ? response.error
+      : data?.error && typeof data.error === "object"
+        ? data.error
+        : null;
+
+  const code = typeof error?.code === "string" ? error.code : "";
+  const message =
+    typeof error?.message === "string"
+      ? error.message
+      : typeof data?.message === "string"
+        ? data.message
+        : "Upstream failure";
+
+  return {
+    status: code === "rate_limit_exceeded" ? 429 : 502,
+    type: code === "rate_limit_exceeded" ? "rate_limit_error" : fallbackType,
+    code: code || (fallbackType === "rate_limit_error" ? "rate_limit_exceeded" : "bad_gateway"),
+    message,
+  };
+}
+
 /**
  * Translate OpenAI Responses API chunk to OpenAI Chat Completions format
  * This is for when Codex returns data and we need to send it to an OpenAI-compatible client
@@ -455,6 +487,19 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   // Handle different event types from Responses API
   const eventType = chunk.type || chunk.event;
   const data = chunk.data || chunk;
+
+  if (!state.model) {
+    const upstreamModel =
+      (data?.response && typeof data.response === "object" && data.response.model) ||
+      data?.model ||
+      data?.modelVersion ||
+      data?.model_version ||
+      null;
+
+    if (typeof upstreamModel === "string" && upstreamModel.trim().length > 0) {
+      state.model = upstreamModel.trim();
+    }
+  }
 
   // Initialize state
   if (!state.started) {
@@ -662,8 +707,17 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     if (responseUsage && typeof responseUsage === "object") {
       const inputTokens = responseUsage.input_tokens || responseUsage.prompt_tokens || 0;
       const outputTokens = responseUsage.output_tokens || responseUsage.completion_tokens || 0;
-      const cacheReadTokens = responseUsage.cache_read_input_tokens || 0;
+      const cacheReadTokens =
+        responseUsage.cache_read_input_tokens ||
+        responseUsage.input_tokens_details?.cached_tokens ||
+        responseUsage.prompt_tokens_details?.cached_tokens ||
+        0;
       const cacheCreationTokens = responseUsage.cache_creation_input_tokens || 0;
+      const reasoningTokens =
+        responseUsage.output_tokens_details?.reasoning_tokens ||
+        responseUsage.completion_tokens_details?.reasoning_tokens ||
+        responseUsage.reasoning_tokens ||
+        0;
 
       // prompt_tokens = input_tokens + cache_read + cache_creation (all prompt-side tokens)
       const promptTokens = inputTokens + cacheReadTokens + cacheCreationTokens;
@@ -683,6 +737,13 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
         if (cacheCreationTokens > 0) {
           state.usage.prompt_tokens_details.cache_creation_tokens = cacheCreationTokens;
         }
+      }
+
+      // Add completion_tokens_details if reasoning tokens exist
+      if (reasoningTokens > 0) {
+        state.usage.completion_tokens_details = {
+          reasoning_tokens: reasoningTokens,
+        };
       }
     }
 
@@ -716,8 +777,17 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     return null;
   }
 
+  if (eventType === "response.failed" || eventType === "error") {
+    state.upstreamError = normalizeUpstreamFailure(data);
+    state.finishReasonSent = true;
+    return null;
+  }
+
   // Reasoning events — emit as reasoning_content in Chat format
-  if (eventType === "response.reasoning_summary_text.delta") {
+  if (
+    eventType === "response.reasoning_content_text.delta" ||
+    eventType === "response.reasoning_text.delta"
+  ) {
     const reasoningDelta = data.delta || "";
     if (!reasoningDelta) return null;
     return {
@@ -729,6 +799,25 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
         {
           index: 0,
           delta: { reasoning_content: reasoningDelta },
+          finish_reason: null,
+        },
+      ],
+    };
+  }
+
+  // Handle true reasoning summary ("Thought for 15s")
+  if (eventType === "response.reasoning_summary_text.delta") {
+    const reasoningDelta = data.delta || "";
+    if (!reasoningDelta) return null;
+    return {
+      id: state.chatId,
+      object: "chat.completion.chunk",
+      created: state.created,
+      model: state.model || "gpt-4",
+      choices: [
+        {
+          index: 0,
+          delta: { reasoning: { summary: reasoningDelta } },
           finish_reason: null,
         },
       ],

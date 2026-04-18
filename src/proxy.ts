@@ -1,13 +1,41 @@
 import { NextResponse } from "next/server";
 import { jwtVerify, SignJWT } from "jose";
 import { generateRequestId } from "./shared/utils/requestId";
-import { getSettings } from "./lib/localDb";
-import { isPublicRoute, verifyAuth, isAuthRequired } from "./shared/utils/apiAuth";
 import { checkBodySize, getBodySizeLimit } from "./shared/middleware/bodySizeGuard";
 import { isDraining } from "./lib/gracefulShutdown";
-import { isModelSyncInternalRequest } from "./shared/services/modelSyncScheduler";
+import { isPublicApiRoute } from "./shared/constants/publicApiRoutes";
 
-const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || "");
+const E2E_MODE = process.env.NEXT_PUBLIC_OMNIROUTE_E2E_MODE === "1";
+
+let apiAuthModulePromise: Promise<typeof import("./shared/utils/apiAuth")> | null = null;
+let settingsModulePromise: Promise<typeof import("./lib/db/settings")> | null = null;
+let modelSyncModulePromise: Promise<typeof import("./shared/services/modelSyncScheduler")> | null =
+  null;
+
+function getJwtSecret(): Uint8Array {
+  return new TextEncoder().encode(process.env.JWT_SECRET || "");
+}
+
+async function getApiAuthModule() {
+  if (!apiAuthModulePromise) {
+    apiAuthModulePromise = import("./shared/utils/apiAuth");
+  }
+  return apiAuthModulePromise;
+}
+
+async function getSettingsModule() {
+  if (!settingsModulePromise) {
+    settingsModulePromise = import("./lib/db/settings");
+  }
+  return settingsModulePromise;
+}
+
+async function getModelSyncModule() {
+  if (!modelSyncModulePromise) {
+    modelSyncModulePromise = import("./shared/services/modelSyncScheduler");
+  }
+  return modelSyncModulePromise;
+}
 
 export async function proxy(request: any) {
   const { pathname } = request.nextUrl;
@@ -37,14 +65,24 @@ export async function proxy(request: any) {
     if (bodySizeRejection) return bodySizeRejection;
   }
 
+  if (E2E_MODE) {
+    if (pathname.startsWith("/dashboard")) {
+      return response;
+    }
+    if (pathname.startsWith("/api/") && !pathname.startsWith("/api/v1/")) {
+      return response;
+    }
+  }
+
   // ──────────────── Protect Management API Routes ────────────────
   if (pathname.startsWith("/api/") && !pathname.startsWith("/api/v1/")) {
     // Allow public routes (login, logout, health, etc.)
-    if (isPublicRoute(pathname)) {
+    if (isPublicApiRoute(pathname, request.method)) {
       return response;
     }
 
     // Allow the model auto-sync scheduler to reach only its internal provider routes.
+    const { isModelSyncInternalRequest } = await getModelSyncModule();
     if (
       isModelSyncInternalRequest(request) &&
       /^\/api\/providers\/[^/]+\/(sync-models|models)$/.test(pathname)
@@ -53,6 +91,7 @@ export async function proxy(request: any) {
     }
 
     // Check if auth is required at all (respects requireLogin setting)
+    const { isAuthRequired, verifyAuth } = await getApiAuthModule();
     const authRequired = await isAuthRequired();
     if (!authRequired) {
       return response;
@@ -61,6 +100,7 @@ export async function proxy(request: any) {
     // Verify authentication (JWT cookie or Bearer API key)
     const authError = await verifyAuth(request);
     if (authError) {
+      const status = authError === "Invalid management token" ? 403 : 401;
       return NextResponse.json(
         {
           error: {
@@ -69,7 +109,7 @@ export async function proxy(request: any) {
             correlation_id: requestId,
           },
         },
-        { status: 401 }
+        { status }
       );
     }
   }
@@ -81,11 +121,33 @@ export async function proxy(request: any) {
       return response;
     }
 
+    try {
+      // Direct import — no HTTP self-fetch overhead
+      const { getSettings } = await getSettingsModule();
+      const settings = await getSettings();
+      // Skip auth if login is not required
+      if (settings.requireLogin === false) {
+        return response;
+      }
+      // Skip auth ONLY for fresh installs (before onboarding) where no password exists yet.
+      // Once setupComplete is true, always require auth — prevents bypass if password row is lost (#151)
+      if (!settings.setupComplete && !settings.password && !process.env.INITIAL_PASSWORD) {
+        return response;
+      }
+    } catch (err) {
+      // FASE-01: Log settings fetch errors instead of silencing them
+      console.error("[Middleware] settings_error: Settings read failed:", err.message, {
+        path: pathname,
+        requestId,
+      });
+      // On error, require login (fall through to token check)
+    }
+
     const token = request.cookies.get("auth_token")?.value;
 
     if (token) {
       try {
-        const { payload } = await jwtVerify(token, SECRET);
+        const { payload } = await jwtVerify(token, getJwtSecret());
 
         // Auto-refresh: if token expires within 7 days, issue a fresh 30-day token
         const exp = payload.exp as number;
@@ -96,7 +158,7 @@ export async function proxy(request: any) {
             const freshToken = await new SignJWT({ authenticated: true })
               .setProtectedHeader({ alg: "HS256" })
               .setExpirationTime("30d")
-              .sign(SECRET);
+              .sign(getJwtSecret());
 
             // Detect secure context
             const fwdProto = (request.headers.get("x-forwarded-proto") || "")
@@ -129,30 +191,12 @@ export async function proxy(request: any) {
           tokenPresent: true,
           requestId,
         });
-        return NextResponse.redirect(new URL("/login", request.url));
+        const redirectResponse = NextResponse.redirect(new URL("/login", request.url));
+        redirectResponse.cookies.delete("auth_token");
+        return redirectResponse;
       }
     }
 
-    try {
-      // Direct import — no HTTP self-fetch overhead
-      const settings = await getSettings();
-      // Skip auth if login is not required
-      if (settings.requireLogin === false) {
-        return response;
-      }
-      // Skip auth ONLY for fresh installs (before onboarding) where no password exists yet.
-      // Once setupComplete is true, always require auth — prevents bypass if password row is lost (#151)
-      if (!settings.setupComplete && !settings.password && !process.env.INITIAL_PASSWORD) {
-        return response;
-      }
-    } catch (err) {
-      // FASE-01: Log settings fetch errors instead of silencing them
-      console.error("[Middleware] settings_error: Settings read failed:", err.message, {
-        path: pathname,
-        requestId,
-      });
-      // On error, require login
-    }
     return NextResponse.redirect(new URL("/login", request.url));
   }
 

@@ -1,8 +1,8 @@
 /**
- * API Authentication Guard — Shared utility for protecting management API routes.
+ * API Authentication Guard — Shared utility for protecting API routes.
  *
- * Provides dual-mode auth: JWT cookie (dashboard session) or Bearer API key.
- * Used by the middleware (proxy.ts) to guard /api/* management routes.
+ * Management APIs require a dashboard session, while client-facing APIs may still
+ * accept Bearer API keys. Route scope is inferred from the request pathname.
  *
  * @module shared/utils/apiAuth
  */
@@ -10,70 +10,158 @@
 import { jwtVerify } from "jose";
 import { cookies } from "next/headers";
 import { getSettings } from "@/lib/localDb";
+import { isPublicApiRoute } from "@/shared/constants/publicApiRoutes";
 
-// ──────────────── Public Routes (No Auth Required) ────────────────
+type RequestLike = {
+  cookies?: {
+    get?: (name: string) => { value?: string } | undefined;
+  };
+  headers?: Headers;
+  method?: string;
+  nextUrl?: { pathname?: string | null } | null;
+  url?: string;
+};
 
-/**
- * Routes that are ALWAYS accessible without authentication.
- * Pattern matching: startsWith check against the pathname.
- */
-const PUBLIC_API_ROUTES = [
-  // Auth flow — must be accessible to unauthenticated users
-  "/api/auth/login",
-  "/api/auth/logout",
-  "/api/auth/status",
+function getRequestPathname(request: RequestLike | Request | null | undefined): string | null {
+  const nextPathname =
+    request &&
+    typeof request === "object" &&
+    "nextUrl" in request &&
+    request.nextUrl &&
+    typeof request.nextUrl.pathname === "string"
+      ? request.nextUrl.pathname
+      : null;
 
-  // Settings check — used by login page / onboarding
-  "/api/settings/require-login",
+  if (nextPathname) return nextPathname;
 
-  // Init — first-run setup
-  "/api/init",
+  const rawUrl =
+    request && typeof request === "object" && "url" in request && typeof request.url === "string"
+      ? request.url
+      : "";
 
-  // Health monitoring — probes must work without auth
-  "/api/monitoring/health",
+  if (!rawUrl) return null;
 
-  // LLM proxy routes — use their own API key auth in the SSE layer
-  "/api/v1/",
+  try {
+    return new URL(rawUrl, "http://localhost").pathname;
+  } catch {
+    return null;
+  }
+}
 
-  // Cloud routes — use Bearer API key auth internally
-  "/api/cloud/",
+function getRequestMethod(request: RequestLike | Request | null | undefined): string {
+  if (
+    request &&
+    typeof request === "object" &&
+    "method" in request &&
+    typeof request.method === "string"
+  ) {
+    return request.method.toUpperCase();
+  }
+  return "GET";
+}
 
-  // OAuth callback routes — provider redirects back here
-  "/api/oauth/",
-];
+function getCookieValueFromHeader(headers: Headers | undefined, name: string): string | null {
+  const cookieHeader = headers?.get("cookie") || headers?.get("Cookie");
+  if (!cookieHeader) return null;
+
+  for (const segment of cookieHeader.split(";")) {
+    const [rawKey, ...rawValue] = segment.split("=");
+    if (!rawKey || rawValue.length === 0) continue;
+    if (rawKey.trim() !== name) continue;
+    return rawValue.join("=").trim();
+  }
+
+  return null;
+}
+
+function getBearerToken(request: RequestLike | Request | null | undefined): string | null {
+  const headers =
+    request && typeof request === "object" && "headers" in request ? request.headers : undefined;
+  const authHeader = headers?.get("authorization") || headers?.get("Authorization");
+  if (typeof authHeader !== "string") return null;
+
+  const trimmedHeader = authHeader.trim();
+  if (!trimmedHeader.toLowerCase().startsWith("bearer ")) return null;
+  return trimmedHeader.slice(7).trim() || null;
+}
+
+async function validateBearerApiKey(apiKey: string | null): Promise<boolean> {
+  if (!apiKey) return false;
+
+  try {
+    const { validateApiKey } = await import("@/lib/db/apiKeys");
+    return await validateApiKey(apiKey);
+  } catch {
+    return false;
+  }
+}
+
+export function isManagementApiRequest(request: RequestLike | Request): boolean {
+  const pathname = getRequestPathname(request);
+  if (!pathname?.startsWith("/api/")) return false;
+  if (pathname.startsWith("/api/v1/")) return false;
+  return !isPublicApiRoute(pathname, getRequestMethod(request));
+}
+
+export async function isDashboardSessionAuthenticated(
+  request?: RequestLike | Request | null
+): Promise<boolean> {
+  if (!process.env.JWT_SECRET) return false;
+
+  let token =
+    request &&
+    typeof request === "object" &&
+    "cookies" in request &&
+    request.cookies?.get?.("auth_token")?.value
+      ? request.cookies.get("auth_token")?.value || null
+      : null;
+
+  const requestHeaders =
+    request && typeof request === "object" && "headers" in request ? request.headers : undefined;
+
+  if (!token) {
+    token = getCookieValueFromHeader(requestHeaders, "auth_token");
+  }
+
+  if (!token) {
+    try {
+      const cookieStore = await cookies();
+      token = cookieStore.get("auth_token")?.value || null;
+    } catch {
+      token = null;
+    }
+  }
+
+  if (!token) return false;
+
+  try {
+    const secret = new TextEncoder().encode(process.env.JWT_SECRET);
+    await jwtVerify(token, secret);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ──────────────── Auth Verification ────────────────
 
 /**
- * Check if a request is authenticated via JWT cookie or Bearer API key.
+ * Check if a request is authenticated.
  *
  * @returns null if authenticated, error message string if not
  */
 export async function verifyAuth(request: any): Promise<string | null> {
-  // 1. Check JWT cookie (dashboard session)
-  const token = request.cookies.get("auth_token")?.value;
-  if (token && process.env.JWT_SECRET) {
-    try {
-      const secret = new TextEncoder().encode(process.env.JWT_SECRET);
-      await jwtVerify(token, secret);
-      return null; // ✔ Authenticated via cookie
-    } catch {
-      // Invalid/expired token — fall through to API key check
-    }
+  if (await isDashboardSessionAuthenticated(request)) {
+    return null;
   }
 
-  // 2. Check Bearer API key
-  const authHeader = request.headers.get("authorization");
-  if (authHeader?.startsWith("Bearer ")) {
-    const apiKey = authHeader.slice(7);
-    try {
-      // Dynamic import to avoid circular dependencies during build
-      const { validateApiKey } = await import("@/lib/db/apiKeys");
-      const isValid = await validateApiKey(apiKey);
-      if (isValid) return null; // ✔ Authenticated via API key
-    } catch {
-      // DB not ready or import error — deny access
-    }
+  const bearerToken = getBearerToken(request);
+  if (isManagementApiRequest(request)) {
+    return bearerToken ? "Invalid management token" : "Authentication required";
+  }
+
+  if (await validateBearerApiKey(bearerToken)) {
+    return null;
   }
 
   return "Authentication required";
@@ -93,41 +181,23 @@ export async function isAuthenticated(request: Request): Promise<boolean> {
   if (!(await isAuthRequired())) {
     return true;
   }
-  // 1. Check API key (for external clients)
-  const authHeader = request.headers.get("authorization");
-  if (authHeader?.startsWith("Bearer ")) {
-    const apiKey = authHeader.slice(7);
-    try {
-      const { validateApiKey } = await import("@/lib/db/apiKeys");
-      if (await validateApiKey(apiKey)) return true;
-    } catch {
-      // DB not ready or import error
-    }
+
+  if (await isDashboardSessionAuthenticated(request)) {
+    return true;
   }
 
-  // 2. Check JWT cookie (for dashboard session)
-  if (process.env.JWT_SECRET) {
-    try {
-      const cookieStore = await cookies();
-      const token = cookieStore.get("auth_token")?.value;
-      if (token) {
-        const secret = new TextEncoder().encode(process.env.JWT_SECRET);
-        await jwtVerify(token, secret);
-        return true;
-      }
-    } catch {
-      // Invalid/expired token or cookies not available
-    }
+  if (isManagementApiRequest(request)) {
+    return false;
   }
 
-  return false;
+  return validateBearerApiKey(getBearerToken(request));
 }
 
 /**
  * Check if a route is in the public (no-auth) allowlist.
  */
-export function isPublicRoute(pathname: string): boolean {
-  return PUBLIC_API_ROUTES.some((route) => pathname.startsWith(route));
+export function isPublicRoute(pathname: string, method = "GET"): boolean {
+  return isPublicApiRoute(pathname, method);
 }
 
 /**

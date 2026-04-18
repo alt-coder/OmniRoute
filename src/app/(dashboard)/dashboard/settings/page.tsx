@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { cn } from "@/shared/utils/cn";
-import { APP_CONFIG } from "@/shared/constants/config";
+import { APP_CONFIG } from "@/shared/constants/appConfig";
 import { useTranslations } from "next-intl";
 import SystemStorageTab from "./components/SystemStorageTab";
 import SecurityTab from "./components/SecurityTab";
@@ -12,14 +12,16 @@ import ComboDefaultsTab from "./components/ComboDefaultsTab";
 import ProxyTab from "./components/ProxyTab";
 import AppearanceTab from "./components/AppearanceTab";
 import ThinkingBudgetTab from "./components/ThinkingBudgetTab";
-import CodexServiceTierTab from "./components/CodexServiceTierTab";
 import SystemPromptTab from "./components/SystemPromptTab";
-import ModelAliasesTab from "./components/ModelAliasesTab";
+import ModelAliasesUnified from "./components/ModelAliasesUnified";
 import BackgroundDegradationTab from "./components/BackgroundDegradationTab";
 import CacheSettingsTab from "./components/CacheSettingsTab";
 import MemorySkillsTab from "./components/MemorySkillsTab";
+import ModelsDevSyncTab from "./components/ModelsDevSyncTab";
 import ResilienceTab from "./components/ResilienceTab";
 import CliproxyapiSettingsTab from "./components/CliproxyapiSettingsTab";
+import PayloadRulesTab from "./components/PayloadRulesTab";
+import ModelRoutingSection from "@/shared/components/ModelRoutingSection";
 
 const tabs = [
   { id: "general", labelKey: "general", icon: "settings" },
@@ -91,10 +93,10 @@ export default function SettingsPage() {
           {activeTab === "ai" && (
             <div className="flex flex-col gap-6">
               <ThinkingBudgetTab />
-              <CodexServiceTierTab />
               <SystemPromptTab />
               <CacheSettingsTab />
               <MemorySkillsTab />
+              <ModelsDevSyncTab />
             </div>
           )}
 
@@ -103,8 +105,9 @@ export default function SettingsPage() {
           {activeTab === "routing" && (
             <div className="flex flex-col gap-6">
               <RoutingTab />
+              <ModelRoutingSection />
               <ComboDefaultsTab />
-              <ModelAliasesTab />
+              <ModelAliasesUnified />
               <BackgroundDegradationTab />
             </div>
           )}
@@ -113,6 +116,7 @@ export default function SettingsPage() {
 
           {activeTab === "advanced" && (
             <div className="flex flex-col gap-6">
+              <PayloadRulesTab />
               <ProxyTab />
               <CliproxyapiSettingsTab />
             </div>

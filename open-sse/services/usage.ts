@@ -3,17 +3,33 @@
  */
 
 import { PROVIDERS } from "../config/constants.ts";
+import {
+  getAntigravityFetchAvailableModelsUrls,
+  ANTIGRAVITY_BASE_URLS,
+} from "../config/antigravityUpstream.ts";
+import { getGlmQuotaUrl } from "../config/glmProvider.ts";
+import {
+  CURSOR_REGISTRY_VERSION,
+  getCursorUsageHeaders,
+  getGitHubCopilotInternalUserHeaders,
+} from "../config/providerHeaderProfiles.ts";
 import { safePercentage } from "@/shared/utils/formatting";
-
-// GitHub API config
-const GITHUB_CONFIG = {
-  apiVersion: "2022-11-28",
-  userAgent: "GitHubCopilotChat/0.26.7",
-};
+import { fetchBailianQuota, type BailianTripleWindowQuota } from "./bailianQuotaFetcher.ts";
+import {
+  antigravityUserAgent,
+  googApiClientHeader,
+  getAntigravityHeaders,
+  getAntigravityLoadCodeAssistMetadata,
+} from "./antigravityHeaders.ts";
+import {
+  getAntigravityRemainingCredits,
+  updateAntigravityRemainingCredits,
+} from "../executors/antigravity.ts";
+import { getCreditsMode } from "./antigravityCredits.ts";
 
 // Antigravity API config (credentials from PROVIDERS via credential loader)
 const ANTIGRAVITY_CONFIG = {
-  quotaApiUrl: "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+  quotaApiUrls: getAntigravityFetchAvailableModelsUrls(),
   loadProjectApiUrl: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
   tokenUrl: "https://oauth2.googleapis.com/token",
   get clientId() {
@@ -22,7 +38,9 @@ const ANTIGRAVITY_CONFIG = {
   get clientSecret() {
     return PROVIDERS.antigravity.clientSecret;
   },
-  userAgent: "antigravity/1.11.3 Darwin/arm64",
+  get userAgent() {
+    return antigravityUserAgent();
+  },
 };
 
 // Codex (OpenAI) API config
@@ -43,6 +61,13 @@ const KIMI_CONFIG = {
   baseUrl: "https://api.kimi.com/coding/v1",
   usageUrl: "https://api.kimi.com/coding/v1/usages",
   apiVersion: "2023-06-01",
+};
+
+const CURSOR_USAGE_CONFIG = {
+  usageUrl: "https://www.cursor.com/api/usage",
+  userMetaUrl: "https://www.cursor.com/api/auth/me",
+  subscriptionUrl: "https://www.cursor.com/api/subscription",
+  clientVersion: CURSOR_REGISTRY_VERSION,
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -100,15 +125,8 @@ function shouldDisplayGitHubQuota(quota: UsageQuota | null): quota is UsageQuota
   return quota.total > 0 || quota.remainingPercentage !== undefined;
 }
 
-// GLM (Z.AI) quota API config
-const GLM_QUOTA_URLS: Record<string, string> = {
-  international: "https://api.z.ai/api/monitor/usage/quota/limit",
-  china: "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
-};
-
 async function getGlmUsage(apiKey: string, providerSpecificData?: Record<string, unknown>) {
-  const region = providerSpecificData?.apiRegion || "international";
-  const quotaUrl = GLM_QUOTA_URLS[region] || GLM_QUOTA_URLS.international;
+  const quotaUrl = getGlmQuotaUrl(providerSpecificData);
 
   const res = await fetch(quotaUrl, {
     headers: {
@@ -154,12 +172,50 @@ async function getGlmUsage(apiKey: string, providerSpecificData?: Record<string,
 }
 
 /**
+ * Bailian (Alibaba Coding Plan) Usage
+ * Fetches triple-window quota (5h, weekly, monthly) and returns worst-case.
+ */
+async function getBailianCodingPlanUsage(
+  connectionId: string,
+  apiKey: string,
+  providerSpecificData?: Record<string, unknown>
+) {
+  try {
+    const connection = { apiKey, providerSpecificData };
+    const quota = await fetchBailianQuota(connectionId, connection);
+
+    if (!quota) {
+      return { message: "Bailian Coding Plan connected. Unable to fetch quota." };
+    }
+
+    const bailianQuota = quota as BailianTripleWindowQuota;
+    const used = bailianQuota.used;
+    const total = bailianQuota.total;
+    const remaining = Math.max(0, total - used);
+    const remainingPercentage = Math.round(remaining);
+
+    return {
+      plan: "Alibaba Coding Plan",
+      used,
+      total,
+      remaining,
+      remainingPercentage,
+      resetAt: bailianQuota.resetAt,
+      unlimited: false,
+      displayName: "Alibaba Coding Plan",
+    };
+  } catch (error) {
+    return { message: `Bailian Coding Plan error: ${(error as Error).message}` };
+  }
+}
+
+/**
  * Get usage data for a provider connection
  * @param {Object} connection - Provider connection with accessToken
  * @returns {Promise<unknown>} Usage data with quotas
  */
 export async function getUsageForProvider(connection) {
-  const { provider, accessToken, apiKey, providerSpecificData, projectId } = connection;
+  const { id, provider, accessToken, apiKey, providerSpecificData, projectId, email } = connection;
 
   switch (provider) {
     case "github":
@@ -167,7 +223,7 @@ export async function getUsageForProvider(connection) {
     case "gemini-cli":
       return await getGeminiUsage(accessToken, providerSpecificData, projectId);
     case "antigravity":
-      return await getAntigravityUsage(accessToken, undefined);
+      return await getAntigravityUsage(accessToken, providerSpecificData, projectId, id);
     case "claude":
       return await getClaudeUsage(accessToken);
     case "codex":
@@ -179,9 +235,14 @@ export async function getUsageForProvider(connection) {
     case "qwen":
       return await getQwenUsage(accessToken, providerSpecificData);
     case "qoder":
-      return await getIflowUsage(accessToken);
+      return await getQoderUsage(accessToken);
     case "glm":
+    case "glmt":
       return await getGlmUsage(apiKey, providerSpecificData);
+    case "cursor":
+      return await getCursorUsage(accessToken);
+    case "bailian-coding-plan":
+      return await getBailianCodingPlanUsage(id, apiKey, providerSpecificData);
     default:
       return { message: `Usage API not implemented for ${provider}` };
   }
@@ -227,14 +288,7 @@ async function getGitHubUsage(accessToken, providerSpecificData) {
 
     // copilot_internal/user API requires GitHub OAuth token, not copilotToken
     const response = await fetch("https://api.github.com/copilot_internal/user", {
-      headers: {
-        Authorization: `token ${accessToken}`,
-        Accept: "application/json",
-        "X-GitHub-Api-Version": GITHUB_CONFIG.apiVersion,
-        "User-Agent": GITHUB_CONFIG.userAgent,
-        "Editor-Version": "vscode/1.100.0",
-        "Editor-Plugin-Version": "copilot-chat/0.26.7",
-      },
+      headers: getGitHubCopilotInternalUserHeaders(`token ${accessToken}`),
     });
 
     if (!response.ok) {
@@ -413,6 +467,172 @@ function inferGitHubPlanName(data: JsonRecord, premiumQuota: UsageQuota | null):
     return label ? `Copilot ${label}` : "GitHub Copilot";
   }
   return "GitHub Copilot";
+}
+
+function buildCursorUsageHeaders(accessToken: string): Record<string, string> {
+  return getCursorUsageHeaders(accessToken, CURSOR_USAGE_CONFIG.clientVersion);
+}
+
+function getFirstPositiveNumber(...values: unknown[]): number {
+  for (const value of values) {
+    const parsed = toNumber(value, Number.NaN);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return 0;
+}
+
+function getCursorMonthlyRequestLimit(usageData: JsonRecord, subscriptionData: JsonRecord): number {
+  return getFirstPositiveNumber(
+    getFieldValue(subscriptionData, "team_max_monthly_requests", "teamMaxMonthlyRequests"),
+    getFieldValue(usageData, "team_max_request_usage", "teamMaxRequestUsage"),
+    getFieldValue(subscriptionData, "team_max_request_usage", "teamMaxRequestUsage"),
+    getFieldValue(usageData, "hard_limit", "hardLimit"),
+    getFieldValue(subscriptionData, "max_monthly_requests", "maxMonthlyRequests")
+  );
+}
+
+function getCursorOnDemandLimit(usageData: JsonRecord, subscriptionData: JsonRecord): number {
+  const onDemand = toRecord(getFieldValue(usageData, "on_demand", "onDemand"));
+  return getFirstPositiveNumber(
+    getFieldValue(onDemand, "max_requests", "maxRequests"),
+    getCursorMonthlyRequestLimit(usageData, subscriptionData)
+  );
+}
+
+function formatCursorQuota(
+  usedValue: unknown,
+  totalValue: unknown,
+  resetValue: unknown
+): UsageQuota {
+  const total = Math.max(0, toNumber(totalValue, 0));
+  const rawUsed = Math.max(0, toNumber(usedValue, 0));
+  const used = total > 0 ? Math.min(rawUsed, total) : rawUsed;
+  const remaining = total > 0 ? Math.max(total - used, 0) : 0;
+
+  return {
+    used,
+    total,
+    remaining,
+    remainingPercentage: total > 0 ? clampPercentage((remaining / total) * 100) : 0,
+    resetAt: parseResetTime(resetValue),
+    unlimited: false,
+  };
+}
+
+function inferCursorPlanName(userMeta: JsonRecord, subscriptionData: JsonRecord): string {
+  const teamInfo = toRecord(getFieldValue(userMeta, "team_info", "teamInfo"));
+  const candidates = [
+    getFieldValue(userMeta, "plan", "plan"),
+    getFieldValue(userMeta, "subscription_type", "subscriptionType"),
+    getFieldValue(subscriptionData, "subscription_type", "subscriptionType"),
+    getFieldValue(subscriptionData, "plan", "plan"),
+  ];
+  const planText = candidates.find((value) => typeof value === "string" && value.trim().length > 0);
+  const normalized = typeof planText === "string" ? planText.trim().toLowerCase() : "";
+
+  if (Object.keys(teamInfo).length > 0 || normalized.includes("team")) return "Cursor Team";
+  if (normalized.includes("enterprise")) return "Cursor Enterprise";
+  if (normalized.includes("pro")) return "Cursor Pro";
+  if (normalized.includes("free")) return "Cursor Free";
+  return "Cursor";
+}
+
+async function fetchCursorUsageDocument(url: string, accessToken: string) {
+  const response = await fetch(url, {
+    method: "GET",
+    headers: buildCursorUsageHeaders(accessToken),
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    return {
+      ok: false,
+      status: response.status,
+      data: {} as JsonRecord,
+      text,
+    };
+  }
+
+  try {
+    const parsed = text ? JSON.parse(text) : {};
+    return {
+      ok: true,
+      status: response.status,
+      data: toRecord(parsed),
+      text,
+    };
+  } catch {
+    return {
+      ok: false,
+      status: response.status,
+      data: {} as JsonRecord,
+      text,
+    };
+  }
+}
+
+async function getCursorUsage(accessToken: string) {
+  try {
+    if (!accessToken) {
+      return {
+        message: "Cursor token expired or unavailable. Please re-authenticate the connection.",
+      };
+    }
+
+    const [usageSummary, userMeta, subscription] = await Promise.all([
+      fetchCursorUsageDocument(CURSOR_USAGE_CONFIG.usageUrl, accessToken),
+      fetchCursorUsageDocument(CURSOR_USAGE_CONFIG.userMetaUrl, accessToken),
+      fetchCursorUsageDocument(CURSOR_USAGE_CONFIG.subscriptionUrl, accessToken),
+    ]);
+
+    const authDenied = [usageSummary, userMeta, subscription].some(
+      (result) => result.status === 401 || result.status === 403
+    );
+    if (authDenied) {
+      return {
+        message:
+          "Cursor token expired or permission denied. Please re-authenticate the connection.",
+      };
+    }
+
+    const usageData = usageSummary.data;
+    const userMetaData = userMeta.data;
+    const subscriptionData = subscription.data;
+    const plan = inferCursorPlanName(userMetaData, subscriptionData);
+
+    const quotas: Record<string, UsageQuota> = {};
+    const totalUsed = getFieldValue(usageData, "num_requests_total", "numRequestsTotal");
+    const totalLimit = getCursorMonthlyRequestLimit(usageData, subscriptionData);
+    const totalReset =
+      getFieldValue(usageData, "reset_date", "resetDate") ||
+      getFieldValue(subscriptionData, "reset_date", "resetDate");
+
+    if (toNumber(totalUsed, 0) > 0 || totalLimit > 0) {
+      quotas.requests = formatCursorQuota(totalUsed, totalLimit, totalReset);
+    }
+
+    const onDemand = toRecord(getFieldValue(usageData, "on_demand", "onDemand"));
+    const onDemandUsed = getFieldValue(onDemand, "num_requests", "numRequests");
+    const onDemandLimit = getCursorOnDemandLimit(usageData, subscriptionData);
+    const onDemandReset =
+      getFieldValue(onDemand, "reset_date", "resetDate") ||
+      getFieldValue(usageData, "reset_date", "resetDate") ||
+      getFieldValue(subscriptionData, "reset_date", "resetDate");
+
+    if (toNumber(onDemandUsed, 0) > 0 || onDemandLimit > 0) {
+      quotas.on_demand = formatCursorQuota(onDemandUsed, onDemandLimit, onDemandReset);
+    }
+
+    if (Object.keys(quotas).length > 0) {
+      return { plan, quotas };
+    }
+
+    return { plan, message: "Cursor connected. Unable to parse quota data." };
+  } catch (error) {
+    return { message: `Unable to fetch Cursor usage: ${(error as Error).message}` };
+  }
 }
 
 // ── Gemini CLI subscription info cache ──────────────────────────────────────
@@ -656,27 +876,153 @@ function getAntigravityPlanLabel(subscriptionInfo) {
 }
 
 /**
+ * Proactive credit balance probe for Antigravity.
+ *
+ * Fires a minimal streamGenerateContent request with GOOGLE_ONE_AI credits enabled
+ * and maxOutputTokens=1 to extract the `remainingCredits` field from the SSE stream.
+ * This uses ~1 credit but lets us show the balance on the dashboard without waiting
+ * for a real user request.
+ *
+ * Returns the credit balance, or null if the probe failed.
+ */
+async function probeAntigravityCreditBalance(
+  accessToken: string,
+  accountId: string,
+  projectId?: string | null
+): Promise<number | null> {
+  try {
+    if (!projectId) return null;
+
+    // Try all base URLs (some accounts only work with specific endpoints)
+    for (const baseUrl of ANTIGRAVITY_BASE_URLS) {
+      const url = `${baseUrl}/v1internal:streamGenerateContent?alt=sse`;
+
+      const sessionId = `-${Math.floor(Math.random() * 9_000_000_000_000_000_000)}`;
+      const body = {
+        project: projectId,
+        model: "gemini-2-flash",
+        userAgent: "antigravity",
+        requestType: "agent",
+        requestId: `credits-probe-${Date.now()}`,
+        enabledCreditTypes: ["GOOGLE_ONE_AI"],
+        request: {
+          model: "gemini-2-flash",
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          generationConfig: { maxOutputTokens: 1 },
+          sessionId,
+        },
+      };
+
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+        "User-Agent": antigravityUserAgent(),
+        "X-Goog-Api-Client": googApiClientHeader(),
+        Accept: "text/event-stream",
+      };
+
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(10_000),
+        });
+
+        if (!res.ok) continue;
+
+        // Read the full SSE response and scan for remainingCredits
+        const rawSSE = await res.text();
+        const lines = rawSSE.split("\n");
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === "[DONE]") break;
+          try {
+            const parsed = JSON.parse(payload);
+            if (Array.isArray(parsed?.remainingCredits)) {
+              const googleCredit = parsed.remainingCredits.find(
+                (c: { creditType?: string }) => c?.creditType === "GOOGLE_ONE_AI"
+              );
+              if (googleCredit) {
+                const balance = parseInt(googleCredit.creditAmount, 10);
+                if (!isNaN(balance)) {
+                  updateAntigravityRemainingCredits(accountId, balance);
+                  return balance;
+                }
+              }
+            }
+          } catch {
+            // Skip malformed SSE lines
+          }
+        }
+      } catch {
+        // Individual endpoint failure; try next
+      }
+    }
+
+    return null;
+  } catch {
+    // Probe is best-effort — don't let it break the usage fetch
+    return null;
+  }
+}
+
+/**
  * Antigravity Usage - Fetch quota from Google Cloud Code API
  * Uses fetchAvailableModels API which returns ALL models (including Claude)
  * with per-model quotaInfo (remainingFraction, resetTime).
  * retrieveUserQuota only returns Gemini models — not suitable for Antigravity.
  */
-async function getAntigravityUsage(accessToken, providerSpecificData) {
+async function getAntigravityUsage(
+  accessToken,
+  providerSpecificData,
+  connectionProjectId?,
+  connectionId?
+) {
   try {
     const subscriptionInfo = await getAntigravitySubscriptionInfoCached(accessToken);
-    const projectId = subscriptionInfo?.cloudaicompanionProject || null;
+    const projectId = connectionProjectId || subscriptionInfo?.cloudaicompanionProject || null;
+
+    // Derive accountId for credit balance cache.
+    // Must match executor key: credentials.connectionId
+    const accountId: string = connectionId || "unknown";
+
+    // Read cached credit balance (hydrated from DB on first access)
+    let creditBalance = getAntigravityRemainingCredits(accountId);
+
+    // If no cached balance and credits mode is enabled, fire a minimal probe
+    const creditsMode = getCreditsMode();
+    if (creditBalance === null && creditsMode !== "off") {
+      creditBalance = await probeAntigravityCreditBalance(accessToken, accountId, projectId);
+    }
 
     // Fetch model list with quota info from fetchAvailableModels
-    const response = await fetch(ANTIGRAVITY_CONFIG.quotaApiUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "User-Agent": ANTIGRAVITY_CONFIG.userAgent,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(projectId ? { project: projectId } : {}),
-      signal: AbortSignal.timeout(10000),
-    });
+    let response: Response | null = null;
+    let lastError: Error | null = null;
+
+    for (const quotaApiUrl of ANTIGRAVITY_CONFIG.quotaApiUrls) {
+      try {
+        response = await fetch(quotaApiUrl, {
+          method: "POST",
+          headers: getAntigravityHeaders("fetchAvailableModels", accessToken),
+          body: JSON.stringify(projectId ? { project: projectId } : {}),
+          signal: AbortSignal.timeout(10000),
+        });
+
+        if (response.ok || response.status === 401 || response.status === 403) {
+          break;
+        }
+      } catch (error) {
+        lastError = error as Error;
+      }
+    }
+
+    if (!response) {
+      throw lastError || new Error("Antigravity API unavailable");
+    }
 
     if (response.status === 403) {
       return { message: "Antigravity access forbidden. Check subscription." };
@@ -748,7 +1094,18 @@ async function getAntigravityUsage(accessToken, providerSpecificData) {
 
     return {
       plan: getAntigravityPlanLabel(subscriptionInfo),
-      quotas,
+      quotas: {
+        ...quotas,
+        ...(creditBalance !== null && {
+          credits: {
+            used: 0,
+            total: 0,
+            remaining: creditBalance,
+            unlimited: false,
+            resetAt: null,
+          },
+        }),
+      },
       subscriptionInfo,
     };
   } catch (error) {
@@ -781,24 +1138,8 @@ async function getAntigravitySubscriptionInfo(accessToken) {
   try {
     const response = await fetch(ANTIGRAVITY_CONFIG.loadProjectApiUrl, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "User-Agent": "google-api-nodejs-client/9.15.1",
-        "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-        "Client-Metadata": JSON.stringify({
-          ideType: "IDE_UNSPECIFIED",
-          platform: "PLATFORM_UNSPECIFIED",
-          pluginType: "GEMINI",
-        }),
-      },
-      body: JSON.stringify({
-        metadata: {
-          ideType: "IDE_UNSPECIFIED",
-          platform: "PLATFORM_UNSPECIFIED",
-          pluginType: "GEMINI",
-        },
-      }),
+      headers: getAntigravityHeaders("loadCodeAssist", accessToken),
+      body: JSON.stringify({ metadata: getAntigravityLoadCodeAssistMetadata() }),
     });
 
     if (!response.ok) return null;
@@ -1336,7 +1677,7 @@ async function getQwenUsage(accessToken, providerSpecificData) {
 /**
  * Qoder Usage
  */
-async function getIflowUsage(accessToken) {
+async function getQoderUsage(accessToken) {
   try {
     // Qoder may have usage endpoint
     return { message: "Qoder connected. Usage tracked per request." };
@@ -1344,3 +1685,16 @@ async function getIflowUsage(accessToken) {
     return { message: "Unable to fetch Qoder usage." };
   }
 }
+
+export const __testing = {
+  parseResetTime,
+  formatGitHubQuotaSnapshot,
+  inferGitHubPlanName,
+  buildCursorUsageHeaders,
+  formatCursorQuota,
+  getCursorMonthlyRequestLimit,
+  getCursorOnDemandLimit,
+  inferCursorPlanName,
+  getGeminiCliPlanLabel,
+  getAntigravityPlanLabel,
+};

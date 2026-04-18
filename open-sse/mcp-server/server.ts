@@ -12,6 +12,11 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  getComboModelProvider,
+  getComboModelString,
+  getComboStepTarget,
+} from "../../src/lib/combos/steps.ts";
 
 import {
   MCP_TOOLS,
@@ -33,11 +38,12 @@ import {
   bestComboForTaskInput,
   explainRouteInput,
   getSessionSnapshotInput,
+  dbHealthCheckInput,
   syncPricingInput,
 } from "./schemas/tools.ts";
 import { startMcpHeartbeat } from "./runtimeHeartbeat.ts";
 
-import { logToolCall } from "./audit.ts";
+import { closeAuditDb, logToolCall } from "./audit.ts";
 import {
   evaluateToolScopes,
   resolveCallerScopeContext,
@@ -54,15 +60,17 @@ import {
   handleBestComboForTask,
   handleExplainRoute,
   handleGetSessionSnapshot,
+  handleDbHealthCheck,
   handleSyncPricing,
 } from "./tools/advancedTools.ts";
 import { memoryTools } from "./tools/memoryTools.ts";
 import { skillTools } from "./tools/skillTools.ts";
 import { normalizeQuotaResponse } from "../../src/shared/contracts/quota.ts";
+import { resolveOmniRouteBaseUrl } from "../../src/shared/utils/resolveOmniRouteBaseUrl.ts";
 
 // ============ Configuration ============
 
-const OMNIROUTE_BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://localhost:20128";
+const OMNIROUTE_BASE_URL = resolveOmniRouteBaseUrl();
 const OMNIROUTE_API_KEY = process.env.OMNIROUTE_API_KEY || "";
 const MCP_ENFORCE_SCOPES = process.env.OMNIROUTE_MCP_ENFORCE_SCOPES === "true";
 const MCP_ALLOWED_SCOPES = new Set(
@@ -104,11 +112,17 @@ function normalizeComboModels(
   rawModels: unknown
 ): Array<{ provider: string; model: string; priority: number }> {
   return toArray(rawModels).map((rawModel, index) => {
-    const model = toRecord(rawModel);
+    const modelRecord = toRecord(rawModel);
+    const modelString = getComboModelString(rawModel);
+    const target = getComboStepTarget(rawModel);
+    const provider =
+      getComboModelProvider(rawModel) ||
+      (modelString ? "unknown" : target ? "combo" : toString(modelRecord.provider, "unknown"));
+
     return {
-      provider: toString(model.provider, "unknown"),
-      model: toString(model.model, "unknown"),
-      priority: toNumber(model.priority, index + 1),
+      provider,
+      model: modelString || target || toString(modelRecord.model, "unknown"),
+      priority: toNumber(modelRecord.priority, index + 1),
     };
   });
 }
@@ -124,7 +138,8 @@ async function omniRouteFetch(path: string, options: RequestInit = {}): Promise<
     ...((options.headers as Record<string, string>) || {}),
   };
 
-  const response = await fetch(url, { ...options, headers, signal: AbortSignal.timeout(10000) });
+  const signal = options.signal || AbortSignal.timeout(10000);
+  const response = await fetch(url, { ...options, headers, signal });
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "Unknown error");
@@ -510,7 +525,11 @@ async function handleWebSearch(args: {
     | "brave-search"
     | "perplexity-search"
     | "exa-search"
-    | "tavily-search";
+    | "tavily-search"
+    | "google-pse-search"
+    | "linkup-search"
+    | "searchapi-search"
+    | "searxng-search";
 }) {
   const start = Date.now();
   try {
@@ -524,6 +543,7 @@ async function handleWebSearch(args: {
     const result = await omniRouteFetch("/v1/search", {
       method: "POST",
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60000),
     });
     await logToolCall("omniroute_web_search", args, result, Date.now() - start, true);
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
@@ -748,6 +768,18 @@ export function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "omniroute_db_health_check",
+    {
+      description:
+        "Diagnoses or repairs OmniRoute database drift, including broken combo references and orphan quota/domain rows",
+      inputSchema: dbHealthCheckInput,
+    },
+    withScopeEnforcement("omniroute_db_health_check", (args) =>
+      handleDbHealthCheck(dbHealthCheckInput.parse(args ?? {}))
+    )
+  );
+
+  server.registerTool(
     "omniroute_sync_pricing",
     {
       description:
@@ -848,6 +880,9 @@ export async function startMcpStdio(): Promise<void> {
     await server.connect(transport);
     console.error("[MCP] OmniRoute MCP Server connected and ready.");
   } finally {
+    if (closeAuditDb()) {
+      console.error("[MCP] Audit database checkpointed and closed.");
+    }
     stopHeartbeatOnce();
     process.off("exit", stopHeartbeatOnce);
     process.off("SIGINT", stopHeartbeatOnce);

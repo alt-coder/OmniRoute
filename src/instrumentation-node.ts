@@ -20,6 +20,12 @@ function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function isBackgroundServicesDisabled(): boolean {
+  const raw = process.env.OMNIROUTE_DISABLE_BACKGROUND_SERVICES;
+  if (!raw) return false;
+  return new Set(["1", "true", "yes", "on"]).has(raw.trim().toLowerCase());
+}
+
 async function ensureSecrets(): Promise<void> {
   let getPersistedSecret = (_key: string): string | null => null;
   let persistSecret = (_key: string, _value: string): void => {};
@@ -68,6 +74,8 @@ export async function registerNodejs(): Promise<void> {
   console.log("[STARTUP] Global fetch proxy patch initialized");
 
   await ensureSecrets();
+  const { enforceWebRuntimeEnv } = await import("@/lib/env/runtimeEnv");
+  enforceWebRuntimeEnv();
 
   // Trigger request-log layout migration during startup, before any request hits usageDb.
   await import("@/lib/usage/migrations");
@@ -79,54 +87,95 @@ export async function registerNodejs(): Promise<void> {
     { initGracefulShutdown },
     { initApiBridgeServer },
     { startBackgroundRefresh },
+    { ensureCloudSyncInitialized },
     { startProviderLimitsSyncScheduler },
     { getSettings },
+    { applyRuntimeSettings },
+    { startRuntimeConfigHotReload },
+    { startSpendBatchWriter },
+    { registerDefaultGuardrails },
+    { ensurePersistentManagementPasswordHash },
+    { skillExecutor },
+    { registerBuiltinSkills },
   ] = await Promise.all([
     import("@/lib/gracefulShutdown"),
     import("@/lib/apiBridgeServer"),
     import("@/domain/quotaCache"),
+    import("@/lib/initCloudSync"),
     import("@/shared/services/providerLimitsSyncScheduler"),
     import("@/lib/db/settings"),
+    import("@/lib/config/runtimeSettings"),
+    import("@/lib/config/hotReload"),
+    import("@/lib/spend/batchWriter"),
+    import("@/lib/guardrails"),
+    import("@/lib/auth/managementPassword"),
+    import("@/lib/skills/executor"),
+    import("@/lib/skills/builtins"),
   ]);
 
   initGracefulShutdown();
   initApiBridgeServer();
-  startBackgroundRefresh();
-  console.log("[STARTUP] Quota cache background refresh started");
-  startProviderLimitsSyncScheduler();
-  console.log("[STARTUP] Provider limits sync scheduler started");
+  startSpendBatchWriter();
+  registerDefaultGuardrails();
+  registerBuiltinSkills(skillExecutor);
+  console.log("[STARTUP] Spend batch writer started");
+  console.log("[STARTUP] Guardrail registry initialized");
+  console.log("[STARTUP] Builtin skill handlers registered");
+  if (!isBackgroundServicesDisabled()) {
+    startBackgroundRefresh();
+    console.log("[STARTUP] Quota cache background refresh started");
+    startProviderLimitsSyncScheduler();
+    console.log("[STARTUP] Provider limits sync scheduler started");
+    const cloudSyncInitialized = await ensureCloudSyncInitialized();
+    console.log(
+      `[STARTUP] Cloud/model sync background bootstrap ${cloudSyncInitialized ? "initialized" : "skipped"}`
+    );
+  }
 
   try {
-    const [{ setCustomAliases }, { setDefaultFastServiceTierEnabled }] = await Promise.all([
-      import("@omniroute/open-sse/services/modelDeprecation.ts"),
-      import("@omniroute/open-sse/executors/codex.ts"),
-    ]);
-    const settings = await getSettings();
+    const [{ migrateCodexConnectionDefaultsFromLegacySettings }, { seedDefaultModelAliases }] =
+      await Promise.all([
+        import("@/lib/providers/codexConnectionDefaults"),
+        import("@/lib/modelAliasSeed"),
+      ]);
+    let settings = await getSettings();
+    const passwordState = await ensurePersistentManagementPasswordHash({
+      logger: console,
+      settings,
+      source: "startup",
+    });
+    settings = passwordState.settings;
+    const runtimeChanges = await applyRuntimeSettings(settings, { force: true, source: "startup" });
+    if (runtimeChanges.length > 0) {
+      console.log(
+        `[STARTUP] Runtime settings hydrated: ${runtimeChanges
+          .map((entry) => entry.section)
+          .join(", ")}`
+      );
+    }
 
-    if (settings.modelAliases) {
-      const aliases =
-        typeof settings.modelAliases === "string"
-          ? JSON.parse(settings.modelAliases)
-          : settings.modelAliases;
-      if (aliases && typeof aliases === "object") {
-        setCustomAliases(aliases);
-        console.log(
-          `[STARTUP] Restored ${Object.keys(aliases).length} custom model alias(es) from settings`
-        );
+    const seededModelAliases = await seedDefaultModelAliases();
+    console.log(
+      `[STARTUP] Model alias seed: applied=${seededModelAliases.applied.length}, skipped=${seededModelAliases.skipped.length}, failed=${seededModelAliases.failed.length}`
+    );
+
+    const migration = await migrateCodexConnectionDefaultsFromLegacySettings();
+    if (migration.migrated) {
+      console.log(
+        `[STARTUP] Migrated Codex connection defaults for ${migration.updatedConnectionIds.length} connection(s)`
+      );
+      if (settings.cloudEnabled === true) {
+        const [{ syncToCloud }, { getConsistentMachineId }] = await Promise.all([
+          import("@/lib/cloudSync"),
+          import("@/shared/utils/machineId"),
+        ]);
+        const machineId = await getConsistentMachineId();
+        await syncToCloud(machineId);
+        console.log("[STARTUP] Synced migrated Codex connection defaults to cloud");
       }
     }
 
-    const persisted =
-      typeof settings.codexServiceTier === "string"
-        ? JSON.parse(settings.codexServiceTier)
-        : settings.codexServiceTier;
-
-    if (typeof persisted?.enabled === "boolean") {
-      setDefaultFastServiceTierEnabled(persisted.enabled);
-      console.log(
-        `[STARTUP] Restored Codex fast service tier: ${persisted.enabled ? "on" : "off"}`
-      );
-    }
+    startRuntimeConfigHotReload();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn("[STARTUP] Could not restore runtime settings:", msg);

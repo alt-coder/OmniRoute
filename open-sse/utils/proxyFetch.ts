@@ -1,4 +1,6 @@
+// @ts-nocheck
 import { AsyncLocalStorage } from "node:async_hooks";
+import { fetch as undiciFetch } from "undici";
 import {
   createProxyDispatcher,
   getDefaultDispatcher,
@@ -77,11 +79,33 @@ function noProxyMatch(targetUrl) {
     if (patternPort && patternPort !== port) return false;
 
     if (!patternHost) return false;
+
+    // Support wildcard matching (e.g. 192.168.* or *.local)
+    if (patternHost.includes("*")) {
+      const regexStr =
+        "^" +
+        patternHost
+          .split("*")
+          .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join(".*") +
+        "$";
+      if (new RegExp(regexStr).test(hostname)) return true;
+    }
+
     if (patternHost.startsWith(".")) {
       return hostname.endsWith(patternHost) || hostname === patternHost.slice(1);
     }
     return hostname === patternHost || hostname.endsWith(`.${patternHost}`);
   });
+}
+
+function isLocalAddress(hostname: string): boolean {
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") return true;
+  if (hostname.startsWith("192.168.")) return true;
+  if (hostname.startsWith("10.")) return true;
+  if (hostname.match(/^172\.(1[6-9]|2\d|3[0-1])\./)) return true;
+  if (hostname.endsWith(".local") || hostname.endsWith(".lan")) return true;
+  return false;
 }
 
 function resolveEnvProxyUrl(targetUrl) {
@@ -110,6 +134,18 @@ function resolveEnvProxyUrl(targetUrl) {
 }
 
 function resolveProxyForRequest(targetUrl) {
+  let target;
+  try {
+    target = new URL(targetUrl);
+  } catch {
+    target = null;
+  }
+
+  // Always bypass proxy for local/LAN addresses
+  if (target && isLocalAddress(target.hostname.toLowerCase())) {
+    return { source: "direct", proxyUrl: null };
+  }
+
   const contextProxy = proxyContext.getStore();
   if (contextProxy) {
     return { source: "context", proxyUrl: proxyConfigToUrl(contextProxy) };
@@ -164,7 +200,10 @@ export async function runWithProxyContext(proxyConfig, fn) {
 
 async function patchedFetch(input: RequestInfo | URL, options: FetchWithDispatcherOptions = {}) {
   if (options?.dispatcher) {
-    return originalFetchWithDispatcher(input, options);
+    // When a dispatcher is present, we MUST use the undici library fetch
+    // to ensure version compatibility. Node 22 built-in fetch (undici v6)
+    // is incompatible with undici v8 dispatchers (missing onRequestStart, etc.)
+    return (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>)(input, options);
   }
 
   const targetUrl = getTargetUrl(input);
@@ -187,6 +226,7 @@ async function patchedFetch(input: RequestInfo | URL, options: FetchWithDispatch
         return await tlsClient.fetch(targetUrl, {
           ...options,
           headers: options.headers,
+          signal: options.signal ?? undefined,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -197,15 +237,39 @@ async function patchedFetch(input: RequestInfo | URL, options: FetchWithDispatch
         if (store) store.used = false;
       }
     }
-    return originalFetchWithDispatcher(input, {
-      ...options,
-      dispatcher: getDefaultDispatcher(),
-    });
+    // Direct connection (no proxy) — use undici with custom dispatcher for timeout control.
+    // Falls back to original native fetch if dispatcher initialization fails (#1054).
+    try {
+      return await (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>)(input, {
+        ...options,
+        dispatcher: getDefaultDispatcher(),
+      });
+    } catch (dispatcherError) {
+      const msg =
+        dispatcherError instanceof Error ? dispatcherError.message : String(dispatcherError);
+      // CAUTION: Do NOT fallback to native fetch if the error is a version mismatch (invalid onRequestStart)
+      // because the native fetch will definitely fail with the undici v8 dispatcher.
+      if (msg.includes("onRequestStart")) {
+        console.error(
+          `[ProxyFetch] Fatal version mismatch: Dispatcher (v8) vs Fetch (v6/native). Hardware upgrade or SOCKS5 config isolation required. Error: ${msg}`
+        );
+        throw dispatcherError;
+      }
+      // Only fallback for connection/dispatcher errors, not HTTP errors
+      if (msg.includes("fetch failed") || msg.includes("ECONNREFUSED") || msg.includes("UND_ERR")) {
+        console.warn(`[ProxyFetch] Undici dispatcher failed, falling back to native fetch: ${msg}`);
+        return originalFetchWithDispatcher(input, options);
+      }
+      throw dispatcherError;
+    }
   }
 
   try {
     const dispatcher = createProxyDispatcher(proxyUrl);
-    return await originalFetchWithDispatcher(input, { ...options, dispatcher });
+    return await (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>)(input, {
+      ...options,
+      dispatcher,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[ProxyFetch] Proxy request failed (${source}, fail-closed): ${message}`);

@@ -21,9 +21,11 @@ node_modules/
 !.yarn/releases
 !.yarn/versions
 .data/
+.next-playwright/
 
 # testing
 coverage/
+coverage**
 
 # next.js
 .next/
@@ -97,6 +99,10 @@ docs/*
 !docs/MCP-SERVER.md
 !docs/CLI-TOOLS.md
 !docs/COVERAGE_PLAN.md
+!docs/ENVIRONMENT.md
+!docs/UNINSTALL.md
+!docs/I18N.md
+!docs/FLY_IO_DEPLOYMENT_GUIDE.md
 
 
 # open-sse tests
@@ -118,6 +124,7 @@ security-analysis/
 clipr/
 app.log
 *.tgz
+.gh-discussions.json
 
 # Backup directories
 app.__qa_backup/
@@ -159,3 +166,13 @@ typescript
 
 # Superpowers plans/specs (internal tooling, not project code)
 docs/superpowers/
+
+# GitNexus local index
+.gitnexus
+.worktrees
+bin/omniroute.mjs
+
+# Consistent with .dockerignore / .npmignore
+.omc/
+audit-report.json
+bun.lock

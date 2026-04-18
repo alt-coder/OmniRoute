@@ -4,6 +4,11 @@
  */
 export function extractUsageFromResponse(responseBody, provider) {
   if (!responseBody || typeof responseBody !== "object") return null;
+  const providerId = typeof provider === "string" ? provider.toLowerCase() : "";
+  const isClaudeProvider =
+    providerId === "claude" ||
+    providerId === "anthropic" ||
+    providerId.startsWith("anthropic-compatible");
 
   // OpenAI format (has prompt_tokens / completion_tokens)
   if (
@@ -14,33 +19,18 @@ export function extractUsageFromResponse(responseBody, provider) {
     return {
       prompt_tokens: responseBody.usage.prompt_tokens || 0,
       completion_tokens: responseBody.usage.completion_tokens || 0,
-      cached_tokens: responseBody.usage.prompt_tokens_details?.cached_tokens,
-      reasoning_tokens: responseBody.usage.completion_tokens_details?.reasoning_tokens,
-    };
-  }
-
-  // OpenAI Responses API format (input_tokens / output_tokens)
-  const responsesUsage = responseBody.response?.usage || responseBody.usage;
-  if (
-    responsesUsage &&
-    typeof responsesUsage === "object" &&
-    (responsesUsage.input_tokens !== undefined || responsesUsage.output_tokens !== undefined)
-  ) {
-    return {
-      prompt_tokens: responsesUsage.input_tokens || 0,
-      completion_tokens: responsesUsage.output_tokens || 0,
-      cache_read_input_tokens: responsesUsage.cache_read_input_tokens,
       cached_tokens:
-        responsesUsage.input_tokens_details?.cached_tokens ??
-        responsesUsage.cache_read_input_tokens,
-      cache_creation_input_tokens: responsesUsage.cache_creation_input_tokens,
+        responseBody.usage.prompt_tokens_details?.cached_tokens ??
+        responseBody.usage.input_tokens_details?.cached_tokens,
       reasoning_tokens:
-        responsesUsage.reasoning_tokens || responsesUsage.output_tokens_details?.reasoning_tokens,
+        responseBody.usage.completion_tokens_details?.reasoning_tokens ??
+        responseBody.usage.output_tokens_details?.reasoning_tokens,
     };
   }
 
   // Claude format
   if (
+    isClaudeProvider &&
     responseBody.usage &&
     typeof responseBody.usage === "object" &&
     (responseBody.usage.input_tokens !== undefined ||
@@ -58,6 +48,29 @@ export function extractUsageFromResponse(responseBody, provider) {
       completion_tokens: responseBody.usage.output_tokens || 0,
       cache_read_input_tokens: cacheRead,
       cache_creation_input_tokens: cacheCreation,
+    };
+  }
+
+  // OpenAI Responses API format (input_tokens / output_tokens)
+  const responsesUsage = responseBody.response?.usage || responseBody.usage;
+  if (
+    responsesUsage &&
+    typeof responsesUsage === "object" &&
+    (responsesUsage.input_tokens !== undefined || responsesUsage.output_tokens !== undefined)
+  ) {
+    return {
+      prompt_tokens: responsesUsage.input_tokens || 0,
+      completion_tokens: responsesUsage.output_tokens || 0,
+      cache_read_input_tokens: responsesUsage.cache_read_input_tokens,
+      cached_tokens:
+        responsesUsage.input_tokens_details?.cached_tokens ??
+        responsesUsage.prompt_tokens_details?.cached_tokens ??
+        responsesUsage.cache_read_input_tokens,
+      cache_creation_input_tokens: responsesUsage.cache_creation_input_tokens,
+      reasoning_tokens:
+        responsesUsage.output_tokens_details?.reasoning_tokens ??
+        responsesUsage.completion_tokens_details?.reasoning_tokens ??
+        responsesUsage.reasoning_tokens,
     };
   }
 

@@ -6,7 +6,7 @@ import {
   getSettings,
   getCachedSettings,
 } from "@/lib/localDb";
-import { getQuotaWindowStatus, isAccountQuotaExhausted } from "@/domain/quotaCache";
+import { getQuotaCache, getQuotaWindowStatus, isAccountQuotaExhausted } from "@/domain/quotaCache";
 import {
   isAccountUnavailable,
   getUnavailableUntil,
@@ -14,16 +14,18 @@ import {
   formatRetryAfter,
   checkFallbackError,
   isModelLocked,
+  getModelLockoutInfo,
   lockModel,
   hasPerModelQuota,
+  getRuntimeProviderProfile,
+  recordModelLockoutFailure,
 } from "@omniroute/open-sse/services/accountFallback.ts";
-import {
-  isLocalProvider,
-  getPassthroughProviders,
-} from "@omniroute/open-sse/config/providerRegistry.ts";
+import { isLocalProvider } from "@omniroute/open-sse/config/providerRegistry.ts";
 import { COOLDOWN_MS } from "@omniroute/open-sse/config/constants.ts";
+import { preflightQuota } from "@omniroute/open-sse/services/quotaPreflight.ts";
 import { getCodexModelScope } from "@omniroute/open-sse/executors/codex.ts";
 import { getProviderAlias, resolveProviderId } from "@/shared/constants/providers";
+import { isModelExcludedByConnection } from "@/domain/connectionModelRules";
 import * as log from "../utils/logger";
 import { fisherYatesShuffle, getNextFromDeckSync } from "@/shared/utils/shuffleDeck";
 
@@ -64,11 +66,21 @@ interface RecoverableConnectionState {
 interface CredentialSelectionOptions {
   allowSuppressedConnections?: boolean;
   bypassQuotaPolicy?: boolean;
+  forcedConnectionId?: string | null;
+  excludeConnectionIds?: string[] | null;
+}
+
+interface CooldownInspectionState {
+  connection: ProviderConnectionView;
+  connectionCooldownMs: number | null;
+  codexScopeCooldownMs: number | null;
+  retryableModelCooldownMs: number | null;
 }
 
 const CODEX_QUOTA_THRESHOLD_PERCENT = 90;
 const MIN_QUOTA_THRESHOLD_PERCENT = 1;
 const MAX_QUOTA_THRESHOLD_PERCENT = 100;
+const NON_RETRYABLE_MODEL_LOCKOUT_REASONS = new Set(["not_found", "not_found_local"]);
 
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -132,6 +144,16 @@ interface QuotaLimitPolicy {
   enabled: boolean;
   thresholdPercent: number;
   windows: string[];
+}
+
+interface QuotaCacheView {
+  quotas?: Record<
+    string,
+    {
+      remainingPercentage?: number;
+      resetAt?: string | null;
+    }
+  >;
 }
 
 function normalizeQuotaThreshold(value: unknown, fallback = CODEX_QUOTA_THRESHOLD_PERCENT): number {
@@ -300,6 +322,198 @@ function getEarliestFutureDate(candidates: Array<string | null>): string | null 
   );
 }
 
+function isRetryableModelLockoutReason(reason: unknown): boolean {
+  return typeof reason === "string" && reason.length > 0
+    ? !NON_RETRYABLE_MODEL_LOCKOUT_REASONS.has(reason)
+    : false;
+}
+
+function getConnectionQuotaHeadroomPercent(
+  provider: string,
+  connection: ProviderConnectionView
+): number | null {
+  const policy = resolveQuotaLimitPolicy(provider, connection.providerSpecificData);
+  const percentages: number[] = [];
+  const seenWindows = new Set<string>();
+
+  const collectWindow = (windowName: string) => {
+    const normalizedWindow = normalizeWindowName(windowName);
+    if (!normalizedWindow || seenWindows.has(normalizedWindow)) return;
+    seenWindows.add(normalizedWindow);
+
+    const status = getQuotaWindowStatus(connection.id, normalizedWindow, policy.thresholdPercent);
+    if (!status) return;
+    percentages.push(Math.max(0, Math.min(100, status.remainingPercentage)));
+  };
+
+  for (const windowName of policy.windows) {
+    collectWindow(windowName);
+  }
+
+  if (percentages.length > 0) {
+    return Math.min(...percentages);
+  }
+
+  const quotaEntry = getQuotaCache(connection.id) as QuotaCacheView | null;
+  const rawQuotas = quotaEntry?.quotas || {};
+  for (const quota of Object.values(rawQuotas)) {
+    if (!quota) continue;
+    const resetAt = toStringOrNull(quota.resetAt);
+    if (resetAt) {
+      const resetMs = new Date(resetAt).getTime();
+      if (Number.isFinite(resetMs) && resetMs <= Date.now()) {
+        continue;
+      }
+    }
+    const remaining = toNumber(quota.remainingPercentage, Number.NaN);
+    if (Number.isFinite(remaining)) {
+      percentages.push(Math.max(0, Math.min(100, remaining)));
+    }
+  }
+
+  return percentages.length > 0 ? Math.min(...percentages) : null;
+}
+
+function getConnectionErrorPenalty(connection: ProviderConnectionView): number {
+  const errorType = normalizeStatus(connection.lastErrorType);
+  const errorSource = normalizeStatus(connection.lastErrorSource);
+  const numericErrorCode = toNumber(connection.errorCode, 0);
+
+  let penalty = 0;
+  if (connection.lastError) penalty += 6;
+
+  if (
+    errorType === "rate_limited" ||
+    errorType === "quota_exhausted" ||
+    errorType === "quota" ||
+    numericErrorCode === 429
+  ) {
+    penalty += 24;
+  } else if (numericErrorCode === 401 || numericErrorCode === 403 || errorSource === "oauth") {
+    penalty += 18;
+  } else if (numericErrorCode >= 500) {
+    penalty += 10;
+  }
+
+  return penalty;
+}
+
+function getConnectionRecencyPenalty(connection: ProviderConnectionView): number {
+  if (!connection.lastUsedAt) return 0;
+  const ageMs = Date.now() - new Date(connection.lastUsedAt).getTime();
+  if (!Number.isFinite(ageMs)) return 0;
+  if (ageMs < 15_000) return 3;
+  if (ageMs < 60_000) return 2;
+  if (ageMs < 5 * 60_000) return 1;
+  return 0;
+}
+
+function getP2CConnectionScore(
+  provider: string,
+  connection: ProviderConnectionView
+): { score: number; quotaHeadroomPercent: number | null } {
+  const quotaBlocked = evaluateQuotaLimitPolicy(provider, connection).blocked;
+  const quotaExhausted = isAccountQuotaExhausted(connection.id);
+  const quotaHeadroomPercent = getConnectionQuotaHeadroomPercent(provider, connection);
+
+  let quotaPenalty = 0;
+  if (quotaHeadroomPercent !== null) {
+    quotaPenalty += Math.round((100 - quotaHeadroomPercent) / 8);
+    if (quotaHeadroomPercent <= 10) quotaPenalty += 10;
+    else if (quotaHeadroomPercent <= 25) quotaPenalty += 4;
+  } else if (!quotaBlocked && !quotaExhausted) {
+    quotaPenalty += 4;
+  }
+
+  const score =
+    (quotaExhausted ? 200 : 0) +
+    (quotaBlocked ? 80 : 0) +
+    getConnectionErrorPenalty(connection) +
+    Math.min(40, (connection.backoffLevel || 0) * 8) +
+    quotaPenalty +
+    Math.min(12, (connection.consecutiveUseCount || 0) * 2) +
+    getConnectionRecencyPenalty(connection) +
+    Math.min(6, Math.max(0, connection.priority || 0) - 1);
+
+  return { score, quotaHeadroomPercent };
+}
+
+function compareP2CConnections(
+  provider: string,
+  a: ProviderConnectionView,
+  b: ProviderConnectionView
+): number {
+  const aScore = getP2CConnectionScore(provider, a);
+  const bScore = getP2CConnectionScore(provider, b);
+  if (aScore.score !== bScore.score) {
+    return aScore.score - bScore.score;
+  }
+
+  const aHeadroom = aScore.quotaHeadroomPercent ?? -1;
+  const bHeadroom = bScore.quotaHeadroomPercent ?? -1;
+  if (aHeadroom !== bHeadroom) {
+    return bHeadroom - aHeadroom;
+  }
+
+  if ((a.priority || 999) !== (b.priority || 999)) {
+    return (a.priority || 999) - (b.priority || 999);
+  }
+
+  return a.id.localeCompare(b.id);
+}
+
+function normalizeExcludedConnectionIds(
+  excludeConnectionId: string | null,
+  extraExcludedConnectionIds: string[] | null | undefined
+): Set<string> {
+  const normalized = new Set<string>();
+
+  if (typeof excludeConnectionId === "string" && excludeConnectionId.trim().length > 0) {
+    normalized.add(excludeConnectionId.trim());
+  }
+
+  if (Array.isArray(extraExcludedConnectionIds)) {
+    for (const connectionId of extraExcludedConnectionIds) {
+      if (typeof connectionId === "string" && connectionId.trim().length > 0) {
+        normalized.add(connectionId.trim());
+      }
+    }
+  }
+
+  return normalized;
+}
+
+function buildQuotaPreflightRateLimitedResult(
+  provider: string,
+  blockedByPreflight: Array<{
+    id: string;
+    quotaPercent?: number;
+    resetAt?: string | null;
+  }>
+) {
+  const retryAfter =
+    getEarliestFutureDate(blockedByPreflight.map((entry) => entry.resetAt ?? null)) ||
+    new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  const blockedSummary = blockedByPreflight
+    .map((entry) => {
+      const percent = Number.isFinite(entry.quotaPercent)
+        ? `${Math.round((entry.quotaPercent as number) * 100)}%`
+        : "quota exhausted";
+      return `${entry.id.slice(0, 8)}(${percent})`;
+    })
+    .join("; ");
+
+  log.info("AUTH", `${provider} | quota preflight filtered account(s): ${blockedSummary}`);
+
+  return {
+    allRateLimited: true,
+    retryAfter,
+    retryAfterHuman: formatRetryAfter(retryAfter),
+    lastError: `All ${provider} accounts blocked by quota preflight`,
+    lastErrorCode: 429,
+  };
+}
+
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
 
@@ -355,6 +569,14 @@ export async function getProviderCredentials(
 
     const allowSuppressedConnections = options.allowSuppressedConnections === true;
     const bypassQuotaPolicy = options.bypassQuotaPolicy === true;
+    const forcedConnectionId =
+      typeof options.forcedConnectionId === "string" && options.forcedConnectionId.trim().length > 0
+        ? options.forcedConnectionId.trim()
+        : null;
+    const excludedConnectionIds = normalizeExcludedConnectionIds(
+      excludeConnectionId,
+      options.excludeConnectionIds
+    );
 
     // Fix #922: Check for aliases (nvidia/nvidia_nim) to ensure credentials are found
     const providersToSearch = getProviderSearchPool(provider);
@@ -370,9 +592,14 @@ export async function getProviderCredentials(
     if (allowedConnections && allowedConnections.length > 0) {
       connections = connections.filter((conn) => allowedConnections.includes(conn.id));
     }
+    if (forcedConnectionId) {
+      connections = connections.filter((conn) => conn.id === forcedConnectionId);
+    }
     log.debug(
       "AUTH",
-      `${provider} | total connections: ${connections.length}, excludeId: ${excludeConnectionId || "none"}`
+      `${provider} | total connections: ${connections.length}, excludeIds: ${
+        excludedConnectionIds.size > 0 ? Array.from(excludedConnectionIds).join(",") : "none"
+      }, forcedId: ${forcedConnectionId || "none"}`
     );
 
     if (connections.length === 0) {
@@ -381,10 +608,15 @@ export async function getProviderCredentials(
       const allConnectionsResults = await Promise.all(
         providersToSearch.map((p) => getProviderConnections({ provider: p }))
       );
-      const allConnectionsRaw = allConnectionsResults.filter(Array.isArray).flat();
-      const allConnections = (Array.isArray(allConnectionsRaw) ? allConnectionsRaw : [])
+      let allConnections = (allConnectionsResults.filter(Array.isArray).flat() as unknown[])
         .map(toProviderConnection)
         .filter((conn) => conn.id.length > 0);
+      if (allowedConnections && allowedConnections.length > 0) {
+        allConnections = allConnections.filter((conn) => allowedConnections.includes(conn.id));
+      }
+      if (forcedConnectionId) {
+        allConnections = allConnections.filter((conn) => conn.id === forcedConnectionId);
+      }
       log.debug("AUTH", `${provider} | all connections (incl inactive): ${allConnections.length}`);
       if (allConnections.length > 0) {
         const earliest = getEarliestRateLimitedUntil(allConnections);
@@ -436,7 +668,10 @@ export async function getProviderCredentials(
 
     // Filter out unavailable accounts and excluded connection
     const availableConnections = connections.filter((c) => {
-      if (excludeConnectionId && c.id === excludeConnectionId) return false;
+      if (excludedConnectionIds.has(c.id)) return false;
+      if (requestedModel && isModelExcludedByConnection(requestedModel, c.providerSpecificData)) {
+        return false;
+      }
       if (!allowSuppressedConnections) {
         if (isAccountUnavailable(c.rateLimitedUntil)) return false;
         if (isTerminalConnectionStatus(c)) return false;
@@ -452,14 +687,24 @@ export async function getProviderCredentials(
       `${provider} | available: ${availableConnections.length}/${connections.length}`
     );
     connections.forEach((c) => {
-      const excluded = excludeConnectionId && c.id === excludeConnectionId;
+      const excluded = excludedConnectionIds.has(c.id);
       const rateLimited = isAccountUnavailable(c.rateLimitedUntil);
       const terminalStatus = isTerminalConnectionStatus(c);
       const codexScopeLimited = provider === "codex" && isCodexScopeUnavailable(c, requestedModel);
+      const modelLocked =
+        Boolean(requestedModel) && isModelLocked(provider, c.id, requestedModel as string);
+      const modelExcluded =
+        Boolean(requestedModel) &&
+        isModelExcludedByConnection(requestedModel as string, c.providerSpecificData);
       if (excluded || rateLimited) {
         log.debug(
           "AUTH",
           `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${rateLimited ? `rateLimited until ${c.rateLimitedUntil}` : ""}${allowSuppressedConnections && rateLimited ? " (retained for combo live test)" : ""}`
+        );
+      } else if (modelExcluded) {
+        log.debug(
+          "AUTH",
+          `  → ${c.id?.slice(0, 8)} | excluded by per-account model rule for ${requestedModel}`
         );
       } else if (terminalStatus) {
         log.debug(
@@ -476,35 +721,91 @@ export async function getProviderCredentials(
             ? `  → ${c.id?.slice(0, 8)} | retained codex scope-limited account until ${scopeUntil} for combo live test`
             : `  → ${c.id?.slice(0, 8)} | codex scope-limited until ${scopeUntil}`
         );
+      } else if (modelLocked) {
+        const lockout = getModelLockoutInfo(provider, c.id, requestedModel);
+        log.debug(
+          "AUTH",
+          allowSuppressedConnections
+            ? `  → ${c.id?.slice(0, 8)} | retained model lockout for ${requestedModel} (${lockout?.remainingMs || 0}ms remaining) for combo live test`
+            : `  → ${c.id?.slice(0, 8)} | model-locked for ${requestedModel} (${lockout?.remainingMs || 0}ms remaining)`
+        );
       }
     });
 
     if (availableConnections.length === 0) {
+      const cooldownStates: CooldownInspectionState[] = connections.map((connection) => {
+        const connectionCooldownMs = parseFutureDateMs(connection.rateLimitedUntil);
+        const codexScopeCooldownMs =
+          provider === "codex"
+            ? parseFutureDateMs(
+                getCodexScopeRateLimitedUntil(connection.providerSpecificData, requestedModel)
+              )
+            : null;
+        const modelLockout = requestedModel
+          ? getModelLockoutInfo(provider, connection.id, requestedModel)
+          : null;
+        const retryableModelCooldownMs =
+          modelLockout &&
+          modelLockout.remainingMs > 0 &&
+          isRetryableModelLockoutReason(modelLockout.reason)
+            ? Date.now() + modelLockout.remainingMs
+            : null;
+
+        return {
+          connection,
+          connectionCooldownMs,
+          codexScopeCooldownMs,
+          retryableModelCooldownMs,
+        };
+      });
+
+      const cooldownCandidates = cooldownStates
+        .flatMap((state) => {
+          const candidates: Array<{ ms: number; connection: ProviderConnectionView }> = [];
+          if (state.connectionCooldownMs !== null) {
+            candidates.push({ ms: state.connectionCooldownMs, connection: state.connection });
+          }
+          if (state.codexScopeCooldownMs !== null) {
+            candidates.push({ ms: state.codexScopeCooldownMs, connection: state.connection });
+          }
+          if (state.retryableModelCooldownMs !== null) {
+            candidates.push({ ms: state.retryableModelCooldownMs, connection: state.connection });
+          }
+          return candidates;
+        })
+        .sort((a, b) => a.ms - b.ms);
+
+      const allBlockedByModelCooldown =
+        Boolean(requestedModel) &&
+        cooldownStates.length > 0 &&
+        cooldownStates.every((state) => {
+          const hasModelSpecificCooldown =
+            state.codexScopeCooldownMs !== null || state.retryableModelCooldownMs !== null;
+          return hasModelSpecificCooldown && state.connectionCooldownMs === null;
+        });
+
+      const earliestCandidate = cooldownCandidates[0];
       const earliest =
-        getEarliestRateLimitedUntil(connections) ||
-        (provider === "codex"
-          ? getEarliestCodexScopeRateLimitedUntil(connections, requestedModel)
-          : null);
+        earliestCandidate?.ms && Number.isFinite(earliestCandidate.ms)
+          ? new Date(earliestCandidate.ms).toISOString()
+          : null;
+
       if (earliest) {
-        // Find the connection with the earliest rateLimitedUntil to get its error info
-        const rateLimitedConns = connections.filter(
-          (c) => c.rateLimitedUntil && new Date(c.rateLimitedUntil).getTime() > Date.now()
-        );
-        const earliestConn = rateLimitedConns.sort(
-          (a, b) =>
-            new Date(a.rateLimitedUntil || 0).getTime() -
-            new Date(b.rateLimitedUntil || 0).getTime()
-        )[0];
+        const earliestConn = earliestCandidate?.connection;
         log.warn(
           "AUTH",
-          `${provider} | all ${connections.length} active accounts rate limited (${formatRetryAfter(earliest)}) | lastErrorCode=${earliestConn?.errorCode}, lastError=${earliestConn?.lastError?.slice(0, 50)}`
+          allBlockedByModelCooldown
+            ? `${provider} | all ${connections.length} active accounts cooling down for model ${requestedModel} (${formatRetryAfter(earliest)}) | lastErrorCode=${earliestConn?.errorCode}, lastError=${earliestConn?.lastError?.slice(0, 50)}`
+            : `${provider} | all ${connections.length} active accounts rate limited (${formatRetryAfter(earliest)}) | lastErrorCode=${earliestConn?.errorCode}, lastError=${earliestConn?.lastError?.slice(0, 50)}`
         );
         return {
           allRateLimited: true,
           retryAfter: earliest,
           retryAfterHuman: formatRetryAfter(earliest),
           lastError: earliestConn?.lastError || null,
-          lastErrorCode: earliestConn?.errorCode || null,
+          lastErrorCode: allBlockedByModelCooldown ? 429 : earliestConn?.errorCode || null,
+          cooldownScope: allBlockedByModelCooldown ? "model" : "connection",
+          cooldownModel: allBlockedByModelCooldown ? requestedModel : null,
         };
       }
       log.warn("AUTH", `${provider} | all ${connections.length} accounts unavailable`);
@@ -662,22 +963,20 @@ export async function getProviderCredentials(
         });
       }
     } else if (strategy === "p2c") {
-      // Power of Two Choices: pick 2 random, choose the one with fewer failures
-      if (orderedConnections.length <= 2) {
-        connection = orderedConnections[0];
+      const candidatePool = withQuota.length > 0 ? withQuota : orderedConnections;
+      // Power of Two Choices: sample from the quota-eligible pool and compare
+      // health instead of defaulting to random-first selection.
+      if (candidatePool.length <= 2) {
+        connection = [...candidatePool].sort((a, b) => compareP2CConnections(provider, a, b))[0];
       } else {
         const i =
-          parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % orderedConnections.length;
+          parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % candidatePool.length;
         let j =
-          parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) %
-          (orderedConnections.length - 1);
+          parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % (candidatePool.length - 1);
         if (j >= i) j++;
-        const a = orderedConnections[i];
-        const b = orderedConnections[j];
-        // Prefer the one with fewer consecutive uses / better health
-        const scoreA = (a.consecutiveUseCount || 0) + (a.lastError ? 10 : 0);
-        const scoreB = (b.consecutiveUseCount || 0) + (b.lastError ? 10 : 0);
-        connection = scoreA <= scoreB ? a : b;
+        const a = candidatePool[i];
+        const b = candidatePool[j];
+        connection = compareP2CConnections(provider, a, b) <= 0 ? a : b;
       }
     } else if (strategy === "random") {
       // Random: Fisher-Yates-inspired random pick
@@ -735,6 +1034,79 @@ export async function getProviderCredentials(
   }
 }
 
+export async function getProviderCredentialsWithQuotaPreflight(
+  provider: string,
+  excludeConnectionId: string | null = null,
+  allowedConnections: string[] | null = null,
+  requestedModel: string | null = null,
+  options: CredentialSelectionOptions = {}
+) {
+  if (options.bypassQuotaPolicy === true) {
+    return getProviderCredentials(
+      provider,
+      excludeConnectionId,
+      allowedConnections,
+      requestedModel,
+      options
+    );
+  }
+
+  const blockedByPreflight: Array<{
+    id: string;
+    quotaPercent?: number;
+    resetAt?: string | null;
+  }> = [];
+  const excludedConnectionIds = normalizeExcludedConnectionIds(
+    excludeConnectionId,
+    options.excludeConnectionIds
+  );
+
+  while (true) {
+    const credentials = await getProviderCredentials(
+      provider,
+      null,
+      allowedConnections,
+      requestedModel,
+      {
+        ...options,
+        excludeConnectionIds: Array.from(excludedConnectionIds),
+      }
+    );
+
+    if (!credentials) {
+      if (blockedByPreflight.length > 0) {
+        return buildQuotaPreflightRateLimitedResult(provider, blockedByPreflight);
+      }
+      return null;
+    }
+
+    if (credentials.allRateLimited) {
+      return credentials;
+    }
+
+    const preflight = await preflightQuota(provider, credentials.connectionId, credentials);
+    if (preflight.proceed) {
+      return credentials;
+    }
+
+    blockedByPreflight.push({
+      id: credentials.connectionId,
+      quotaPercent: preflight.quotaPercent,
+      resetAt: preflight.resetAt ?? null,
+    });
+    excludedConnectionIds.add(credentials.connectionId);
+
+    log.info(
+      "AUTH",
+      `${provider} | preflight blocked ${credentials.connectionId.slice(0, 8)}${
+        Number.isFinite(preflight.quotaPercent)
+          ? ` at ${Math.round((preflight.quotaPercent as number) * 100)}%`
+          : ""
+      }`
+    );
+  }
+}
+
 /**
  * Mark account as unavailable — reads backoffLevel from DB, calculates cooldown with exponential backoff, saves new level
  * @param {string} connectionId
@@ -749,7 +1121,8 @@ export async function markAccountUnavailable(
   status: number,
   errorText: string,
   provider: string | null = null,
-  model: string | null = null
+  model: string | null = null,
+  providerProfile = null
 ) {
   const currentMutex = markMutexes.get(connectionId) || Promise.resolve();
   let resolveMutex: (() => void) | undefined;
@@ -762,27 +1135,6 @@ export async function markAccountUnavailable(
 
   try {
     await currentMutex;
-
-    // ── Per-model lockout for providers with independent model quotas ──
-    // Providers like Gemini AI Studio have per-model quotas. A 429/404 on one
-    // model must NOT lock out other models on the same API key.
-    if (hasPerModelQuota(provider) && model && (status === 429 || status === 404)) {
-      const reason = status === 404 ? "not_found" : "rate_limited";
-      const cooldown = status === 404 ? COOLDOWN_MS.notFoundLocal : COOLDOWN_MS.rateLimit;
-      lockModel(provider, connectionId, model, reason, cooldown);
-      // Update last error for observability (without changing terminal status)
-      updateProviderConnection(connectionId, {
-        lastErrorType: reason,
-        lastError: `Model ${model} ${reason}`,
-        lastErrorAt: new Date().toISOString(),
-        errorCode: status,
-      }).catch(() => {});
-      log.info(
-        "AUTH",
-        `Model-only lockout for ${provider}:${model} — ${status} ${reason} ${Math.ceil(cooldown / 1000)}s (connection stays active)`
-      );
-      return { shouldFallback: true, cooldownMs: cooldown };
-    }
 
     // Read current connection to get backoffLevel
     const connectionsRaw = await getProviderConnections({ provider });
@@ -834,54 +1186,80 @@ export async function markAccountUnavailable(
       }
     }
 
+    const effectiveProviderProfile =
+      providerProfile || (provider ? await getRuntimeProviderProfile(provider) : null);
+
+    const isPerModelQuotaProvider = hasPerModelQuota(provider, model);
+    if (isPerModelQuotaProvider && provider && model && (status === 404 || status === 429)) {
+      const reason = status === 404 ? "not_found" : "rate_limited";
+      const fallbackCooldown =
+        status === 404
+          ? (effectiveProviderProfile?.transientCooldown ?? COOLDOWN_MS.notFoundLocal)
+          : 0;
+      const lockout = recordModelLockoutFailure(
+        provider,
+        connectionId,
+        model,
+        reason,
+        status,
+        fallbackCooldown,
+        effectiveProviderProfile
+      );
+      // Update last error for observability (without changing terminal status)
+      updateProviderConnection(connectionId, {
+        lastErrorType: reason,
+        lastError: `Model ${model} ${reason}`,
+        lastErrorAt: new Date().toISOString(),
+        errorCode: status,
+      }).catch(() => {});
+      log.info(
+        "AUTH",
+        `Model-only lockout for ${provider}:${model} — ${status} ${reason} ${Math.ceil(lockout.cooldownMs / 1000)}s (failureCount=${lockout.failureCount}, connection stays active)`
+      );
+      return { shouldFallback: true, cooldownMs: lockout.cooldownMs };
+    }
+
     const result = checkFallbackError(
       status,
       errorText,
       backoffLevel,
       model,
-      provider // ← Now passes provider for profile-aware cooldowns
+      provider,
+      null,
+      effectiveProviderProfile
     );
     const { shouldFallback, cooldownMs, newBackoffLevel, reason } = result;
     if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
     // ── 404 model-only lockout: connection stays active ──
-    // For local providers (detected by URL) and cloud providers with passthrough models
-    // (like Antigravity), a 404 means the specific model doesn't exist or isn't available
-    // for this account — it should NOT lock out the entire connection.
+    // For local providers (detected by URL), a 404 means the specific model
+    // doesn't exist or isn't available for this account — it should NOT lock
+    // out the entire connection.
     const connBaseUrl = (conn?.providerSpecificData as Record<string, unknown>)?.baseUrl as
       | string
       | undefined;
 
-    const isPassthroughProvider = provider && getPassthroughProviders().has(provider);
-    const isPerModelQuotaProvider = hasPerModelQuota(provider);
-    if (
-      (isLocalProvider(connBaseUrl) || isPerModelQuotaProvider) &&
-      status === 404 &&
-      provider &&
-      model
-    ) {
-      const localCooldown = COOLDOWN_MS.notFoundLocal;
-      lockModel(provider, connectionId, model, "not_found", localCooldown);
+    if (isLocalProvider(connBaseUrl) && status === 404 && provider && model) {
+      const lockout = recordModelLockoutFailure(
+        provider,
+        connectionId,
+        model,
+        "not_found",
+        status,
+        COOLDOWN_MS.notFoundLocal,
+        effectiveProviderProfile
+      );
+      updateProviderConnection(connectionId, {
+        lastErrorType: "not_found",
+        lastError: `Model ${model} not_found`,
+        lastErrorAt: new Date().toISOString(),
+        errorCode: status,
+      }).catch(() => {});
       log.info(
         "AUTH",
-        `Model-only lockout for ${model} — 404 lockout ${localCooldown / 1000}s (connection stays active)`
+        `Model-only lockout for ${provider}:${model} — 404 not_found ${Math.ceil(lockout.cooldownMs / 1000)}s (failureCount=${lockout.failureCount}, connection stays active)`
       );
-      return { shouldFallback: true, cooldownMs: localCooldown };
-    }
-
-    // ── 429 model-only lockout for per-model quota providers ──
-    // For providers where each model has independent quota (passthrough providers,
-    // Gemini AI Studio), a 429 on one model should NOT lock out the entire connection
-    // — other models may still have quota available. Use lockModel() instead of
-    // connection-wide rateLimitedUntil.
-    if (isPerModelQuotaProvider && status === 429 && provider && model) {
-      const modelCooldown = cooldownMs || COOLDOWN_MS.rateLimit;
-      lockModel(provider, connectionId, model, reason || "rate_limited", modelCooldown);
-      log.info(
-        "AUTH",
-        `Model-only lockout for ${model} — 429 rate limit ${Math.ceil(modelCooldown / 1000)}s (connection stays active)`
-      );
-      return { shouldFallback: true, cooldownMs: modelCooldown };
+      return { shouldFallback: true, cooldownMs: lockout.cooldownMs };
     }
 
     const rateLimitedUntil = getUnavailableUntil(cooldownMs);
@@ -1010,11 +1388,15 @@ export async function clearRecoveredProviderState(
 
 /**
  * Extract API key from request headers
+ * Follows management API standard: case-insensitive bearer matching and full trimming
  */
 export function extractApiKey(request: Request) {
-  const authHeader = request.headers.get("Authorization");
-  if (authHeader?.startsWith("Bearer ")) {
-    return authHeader.slice(7);
+  const authHeader = request.headers.get("Authorization") || request.headers.get("authorization");
+  if (typeof authHeader === "string") {
+    const trimmedHeader = authHeader.trim();
+    if (trimmedHeader.toLowerCase().startsWith("bearer ")) {
+      return trimmedHeader.slice(7).trim();
+    }
   }
   return null;
 }

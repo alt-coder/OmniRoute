@@ -1,30 +1,24 @@
 /**
  * Prompt Injection Guard — Express/Next.js middleware
  *
- * Wraps the inputSanitizer module as middleware for API routes.
- * Blocks or warns on detected prompt injection attempts.
+ * Legacy middleware facade that now delegates to the guardrail system.
  *
  * @module middleware/promptInjectionGuard
  */
 
-import { sanitizeRequest } from "../shared/utils/inputSanitizer";
-
-/**
- * @typedef {Object} GuardOptions
- * @property {"block"|"warn"|"log"} [mode="warn"] - Action on detection
- * @property {Object} [logger] - Logger instance (defaults to console)
- */
+import {
+  evaluatePromptInjection,
+  type PromptInjectionGuardrailOptions,
+} from "@/lib/guardrails/promptInjection";
+import { resolveDisabledGuardrails } from "@/lib/guardrails/registry";
 
 /**
  * Create a prompt injection guard middleware.
  *
- * @param {GuardOptions} [options={}]
+ * @param {PromptInjectionGuardrailOptions} [options={}]
  * @returns {(req: Request) => { blocked: boolean, result: Object }|null}
  */
-export function createInjectionGuard(options: any = {}) {
-  const mode = options.mode || process.env.INJECTION_GUARD_MODE || "warn";
-  const logger = options.logger || console;
-
+export function createInjectionGuard(options: PromptInjectionGuardrailOptions = {}) {
   /**
    * Check a request body for prompt injection.
    *
@@ -36,33 +30,14 @@ export function createInjectionGuard(options: any = {}) {
       return { blocked: false, result: { flagged: false, detections: [], piiDetections: [] } };
     }
 
-    const result: any = sanitizeRequest(body, logger);
-
-    // Check if any detections were found (sanitizeRequest returns .detections, NOT .flagged)
-    if (result.detections.length === 0 && result.piiDetections.length === 0) {
-      return { blocked: false, result };
-    }
-
-    const highSeverity = result.detections.filter((d) => d.severity === "high");
-
-    if (mode === "block" && highSeverity.length > 0) {
-      logger.warn("[InjectionGuard] Blocked request with high-severity injection:", {
-        detections: result.detections.map((d) => ({ pattern: d.pattern, severity: d.severity })),
-      });
-      return { blocked: true, result };
-    }
-
-    if (mode === "warn" || mode === "log") {
-      logger[mode === "warn" ? "warn" : "info"](
-        "[InjectionGuard] Detected potential injection patterns:",
-        {
-          detections: result.detections.map((d) => ({ pattern: d.pattern, severity: d.severity })),
-          pii: result.piiDetections.length,
-        }
-      );
-    }
-
-    return { blocked: false, result };
+    const decision = evaluatePromptInjection(body, options, {
+      disabledGuardrails: resolveDisabledGuardrails({ body }),
+      log: options.logger || console,
+    });
+    return {
+      blocked: decision.blocked,
+      result: decision.result,
+    };
   };
 }
 

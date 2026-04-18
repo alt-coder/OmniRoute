@@ -1,10 +1,21 @@
 // OpenAI helper functions for translator
 
 // Valid OpenAI content block types
-export const VALID_OPENAI_CONTENT_TYPES = ["text", "image_url", "image"];
+export const VALID_OPENAI_CONTENT_TYPES = [
+  "text",
+  "image_url",
+  "image",
+  "file_url",
+  "file",
+  "document",
+];
 export const VALID_OPENAI_MESSAGE_TYPES = [
   "text",
   "image_url",
+  "image",
+  "file_url",
+  "file",
+  "document",
   "image",
   "tool_calls",
   "tool_result",
@@ -94,6 +105,14 @@ export function filterToOpenAIFormat(body) {
   // Strip Claude-specific fields that OpenAI-compatible providers reject
   delete body.metadata;
   delete body.anthropic_version;
+
+  // Map max_output_tokens (from Vercel AI SDK) to max_tokens logic
+  if (body.max_output_tokens !== undefined) {
+    if (body.max_tokens === undefined) {
+      body.max_tokens = body.max_output_tokens;
+    }
+    delete body.max_output_tokens;
+  }
 
   // Normalize tools to OpenAI format (from Claude, Gemini, etc.)
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
