@@ -5,6 +5,8 @@ import {
 import { parseModel, resolveCanonicalProviderModel } from "@omniroute/open-sse/services/model.ts";
 import { MODEL_SPECS, getModelSpec, type ModelSpec } from "@/shared/constants/modelSpecs";
 import { getSyncedCapability } from "@/lib/modelsDevSync";
+import { getCustomModels, getSyncedAvailableModels } from "@/lib/db/models";
+import { getDbInstance } from "@/lib/db/core";
 
 const TOOL_CALLING_UNSUPPORTED_PATTERNS: string[] = [];
 const REASONING_UNSUPPORTED_PATTERNS = [
@@ -88,8 +90,43 @@ function getRegistryModel(providerIdOrAlias: string | null, modelId: string | nu
   if (!providerIdOrAlias || !modelId) return null;
   const providerAlias = PROVIDER_ID_TO_ALIAS[providerIdOrAlias] || providerIdOrAlias;
   const models = PROVIDER_MODELS[providerAlias];
-  if (!Array.isArray(models)) return null;
-  return models.find((model) => model?.id === modelId) || null;
+
+  // 1. Check hardcoded registry
+  if (Array.isArray(models)) {
+    const registry = models.find((model) => model?.id === modelId);
+    if (registry) return registry;
+  }
+
+  // 2. Check custom models (synchronous read from DB instance)
+  try {
+    const db = getDbInstance();
+    const row = db
+      .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
+      .get(providerIdOrAlias);
+    if (row && row.value) {
+      const customModels = JSON.parse(row.value);
+      const custom = customModels.find((m: any) => m.id === modelId);
+      if (custom) return custom;
+    }
+
+    // 3. Check synced available models
+    const rows = db
+      .prepare(
+        "SELECT value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
+      )
+      .all(`${providerIdOrAlias}:%`);
+    for (const r of rows) {
+      if (r && r.value) {
+        const syncedModels = JSON.parse(r.value);
+        const synced = syncedModels.find((m: any) => m.id === modelId);
+        if (synced) return synced;
+      }
+    }
+  } catch (err) {
+    // Silent fail for registry lookup
+  }
+
+  return null;
 }
 
 function resolveCapabilityInput(input: CapabilityInput) {
@@ -196,6 +233,7 @@ function resolveVisionCapability(
   }
 
   if (typeof registryModel?.supportsVision === "boolean") return registryModel.supportsVision;
+  if (typeof (registryModel as any)?.vision === "boolean") return (registryModel as any).vision;
   if (typeof spec?.supportsVision === "boolean") return spec.supportsVision;
 
   return null;
@@ -255,29 +293,32 @@ export function getResolvedModelCapabilities(input: CapabilityInput): ResolvedMo
       modalitiesOutput
     ),
     supportsMaxTokens: heuristicMaxTokens(lookupKey),
-    attachment: synced?.attachment ?? null,
-    structuredOutput: synced?.structured_output ?? null,
-    temperature: synced?.temperature ?? null,
+    attachment: synced?.attachment ?? (registryModel as any)?.attachment ?? null,
+    structuredOutput: synced?.structured_output ?? (registryModel as any)?.structuredOutput ?? null,
+    temperature: synced?.temperature ?? (registryModel as any)?.temperature ?? null,
     contextWindow,
-    maxInputTokens: synced?.limit_input ?? contextWindow,
+    maxInputTokens: synced?.limit_input ?? (registryModel as any)?.inputTokenLimit ?? contextWindow,
     maxOutputTokens:
       synced?.limit_output ??
       (typeof registryModel?.maxOutputTokens === "number" ? registryModel.maxOutputTokens : null) ??
+      (typeof (registryModel as any)?.outputTokenLimit === "number"
+        ? (registryModel as any).outputTokenLimit
+        : null) ??
       spec?.maxOutputTokens ??
       MODEL_SPECS.__default__.maxOutputTokens,
     defaultThinkingBudget: spec?.defaultThinkingBudget ?? 0,
     thinkingBudgetCap: spec?.thinkingBudgetCap ?? null,
     thinkingOverhead: spec?.thinkingOverhead ?? null,
     adaptiveMaxTokens: spec?.adaptiveMaxTokens ?? null,
-    family: synced?.family ?? null,
-    status: synced?.status ?? null,
-    openWeights: synced?.open_weights ?? null,
-    knowledgeCutoff: synced?.knowledge_cutoff ?? null,
-    releaseDate: synced?.release_date ?? null,
-    lastUpdated: synced?.last_updated ?? null,
+    family: synced?.family ?? (registryModel as any)?.family ?? null,
+    status: synced?.status ?? (registryModel as any)?.status ?? null,
+    openWeights: synced?.open_weights ?? (registryModel as any)?.openWeights ?? null,
+    knowledgeCutoff: synced?.knowledge_cutoff ?? (registryModel as any)?.knowledgeCutoff ?? null,
+    releaseDate: synced?.release_date ?? (registryModel as any)?.releaseDate ?? null,
+    lastUpdated: synced?.last_updated ?? (registryModel as any)?.lastUpdated ?? null,
     modalitiesInput,
     modalitiesOutput,
-    interleavedField: synced?.interleaved_field ?? null,
+    interleavedField: synced?.interleaved_field ?? (registryModel as any)?.interleavedField ?? null,
   };
 }
 

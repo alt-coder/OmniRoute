@@ -45,6 +45,34 @@ export function normalizeDiscoveredModels(models: unknown): SyncedAvailableModel
         ).sort()
       : undefined;
 
+    const modalities = Array.isArray(record.modalities)
+      ? record.modalities
+      : (asRecord(record.modalities).input as string[]) || [];
+
+    const hasVision =
+      record.supportsVision === true ||
+      record.vision === true ||
+      modalities.some((m: string) => String(m).includes("image")) ||
+      id.includes("vision") ||
+      id.includes("-v1") ||
+      id.includes("-v2") ||
+      id.includes("-v3") ||
+      id.includes("gpt-4o") ||
+      id.includes("claude-3") ||
+      id.includes("gemini");
+
+    const hasAudio =
+      record.supportsAudio === true ||
+      record.audio === true ||
+      modalities.some((m: string) => String(m).includes("audio"));
+
+    const hasVideo =
+      record.supportsVideo === true ||
+      record.video === true ||
+      modalities.some((m: string) => String(m).includes("video"));
+
+    const hasThinking = record.supportsThinking === true || record.reasoning === true;
+
     deduped.set(id, {
       id,
       name,
@@ -60,7 +88,10 @@ export function normalizeDiscoveredModels(models: unknown): SyncedAvailableModel
         ? { outputTokenLimit: record.outputTokenLimit }
         : {}),
       ...(typeof record.description === "string" ? { description: record.description } : {}),
-      ...(record.supportsThinking === true ? { supportsThinking: true } : {}),
+      ...(hasThinking ? { supportsThinking: true } : {}),
+      ...(hasVision ? { supportsVision: true } : {}),
+      ...(hasAudio ? { supportsAudio: true } : {}),
+      ...(hasVideo ? { supportsVideo: true } : {}),
     });
   }
 

@@ -398,6 +398,9 @@ export async function replaceCustomModels(
     outputTokenLimit?: number;
     description?: string;
     supportsThinking?: boolean;
+    supportsVision?: boolean;
+    supportsAudio?: boolean;
+    supportsVideo?: boolean;
   }>,
   { allowEmpty = false }: { allowEmpty?: boolean } = {}
 ) {
@@ -447,6 +450,21 @@ export async function replaceCustomModels(
         ? { supportsThinking: m.supportsThinking }
         : (prev as any)?.supportsThinking != null
           ? { supportsThinking: (prev as any).supportsThinking }
+          : {}),
+      ...(m.supportsVision != null
+        ? { supportsVision: m.supportsVision }
+        : (prev as any)?.supportsVision != null
+          ? { supportsVision: (prev as any).supportsVision }
+          : {}),
+      ...(m.supportsAudio != null
+        ? { supportsAudio: m.supportsAudio }
+        : (prev as any)?.supportsAudio != null
+          ? { supportsAudio: (prev as any).supportsAudio }
+          : {}),
+      ...(m.supportsVideo != null
+        ? { supportsVideo: m.supportsVideo }
+        : (prev as any)?.supportsVideo != null
+          ? { supportsVideo: (prev as any).supportsVideo }
           : {}),
       // Preserve existing compat flags
       ...(prev && (prev as any).normalizeToolCallId !== undefined
@@ -532,6 +550,9 @@ export interface SyncedAvailableModel {
   outputTokenLimit?: number;
   description?: string;
   supportsThinking?: boolean;
+  supportsVision?: boolean;
+  supportsAudio?: boolean;
+  supportsVideo?: boolean;
 }
 
 type SyncedAvailableModelInput = Omit<SyncedAvailableModel, "source"> & {
@@ -575,6 +596,9 @@ function normalizeSyncedAvailableModel(model: unknown): SyncedAvailableModel | n
       : {}),
     ...(typeof record.description === "string" ? { description: record.description } : {}),
     ...(record.supportsThinking === true ? { supportsThinking: true } : {}),
+    ...(record.supportsVision === true ? { supportsVision: true } : {}),
+    ...(record.supportsAudio === true ? { supportsAudio: true } : {}),
+    ...(record.supportsVideo === true ? { supportsVideo: true } : {}),
   };
 }
 

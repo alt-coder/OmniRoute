@@ -138,7 +138,7 @@ describe("removeRedundantContent", () => {
 });
 
 describe("replaceImageUrls", () => {
-  it("replaces base64 images for non-vision models", () => {
+  it("replaces base64 images when supportsVision is explicitly false", () => {
     const body = {
       messages: [
         {
@@ -147,14 +147,14 @@ describe("replaceImageUrls", () => {
         },
       ],
     };
-    const result = replaceImageUrls(body, "gpt-3.5-turbo");
+    const result = replaceImageUrls(body, { supportsVision: false });
     assert.equal(result.applied, true);
     const content = result.body.messages![0].content as Array<Record<string, unknown>>;
     assert.equal(content[0].type, "text");
     assert.ok((content[0].text as string).includes("[image:"));
   });
 
-  it("keeps images for vision models", () => {
+  it("keeps images when supportsVision is true", () => {
     const body = {
       messages: [
         {
@@ -163,7 +163,35 @@ describe("replaceImageUrls", () => {
         },
       ],
     };
-    const result = replaceImageUrls(body, "gpt-4o");
+    const result = replaceImageUrls(body, { supportsVision: true });
+    assert.equal(result.applied, false);
+  });
+
+  it("keeps images for unknown models (safe default — no stripping)", () => {
+    const body = {
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBOR" } }],
+        },
+      ],
+    };
+    // Unknown models like kimi-k2.6, deepseek-v4, glm-5, custom providers
+    // should NOT have their images stripped (supportsVision defaults to null/unknown)
+    const result = replaceImageUrls(body, { supportsVision: null });
+    assert.equal(result.applied, false);
+  });
+
+  it("keeps images when supportsVision is undefined (unknown)", () => {
+    const body = {
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBOR" } }],
+        },
+      ],
+    };
+    const result = replaceImageUrls(body, {});
     assert.equal(result.applied, false);
   });
 
@@ -171,9 +199,60 @@ describe("replaceImageUrls", () => {
     const body = {
       messages: [{ role: "user", content: "just text" }],
     };
-    const result = replaceImageUrls(body, "gpt-3.5-turbo");
+    const result = replaceImageUrls(body, { supportsVision: false });
     assert.equal(result.applied, false);
   });
+
+  it("keeps images for vision-capable model names via modelSupportsVision", () => {
+    const body = {
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBOR" } }],
+        },
+      ],
+    };
+    // Known vision models should not have images stripped
+    const result = replaceImageUrls(body, "gpt-4o");
+    assert.equal(result.applied, false);
+  });
+});
+
+describe("modelSupportsVision regression (new provider models)", () => {
+  // These models were previously broken because modelSupportsVision used
+  // a hardcoded whitelist that only matched "vision", "gpt-4", "4o", "claude-3", "gemini".
+  // The fix uses getResolvedModelCapabilities, which returns null (unknown)
+  // for unlisted models, and we treat null as vision-capable (safe default).
+  const newProviderModels = [
+    "kimi-k2.6-precision",
+    "kimi-k2.5",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "glm-5.1",
+    "glm-4.7",
+    "mimo-v2.5-pro",
+    "qwen3.6-27b",
+    "minimax-m2.5",
+  ];
+
+  for (const model of newProviderModels) {
+    it(`does not strip images from ${model}`, () => {
+      const body = {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Describe this image" },
+              { type: "image_url", image_url: { url: "data:image/png;base64,iVBOR" } },
+            ],
+          },
+        ],
+      };
+      const result = replaceImageUrls(body, model);
+      // Unknown models should NOT have images stripped
+      assert.equal(result.applied, false);
+    });
+  }
 });
 
 describe("applyLiteCompression", () => {

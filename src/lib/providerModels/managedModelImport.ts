@@ -60,6 +60,9 @@ function normalizeImportedModels(fetchedModels: unknown): ManagedImportedModel[]
       : {}),
     ...(typeof model.description === "string" ? { description: model.description } : {}),
     ...(model.supportsThinking === true ? { supportsThinking: true } : {}),
+    ...(model.supportsVision === true ? { supportsVision: true } : {}),
+    ...(model.supportsAudio === true ? { supportsAudio: true } : {}),
+    ...(model.supportsVideo === true ? { supportsVideo: true } : {}),
   }));
 }
 
@@ -109,6 +112,9 @@ function summarizeImportedChanges(
         : {}),
       ...(typeof model.description === "string" ? { description: model.description } : {}),
       ...(model.supportsThinking === true ? { supportsThinking: true } : {}),
+      ...(model.supportsVision === true ? { supportsVision: true } : {}),
+      ...(model.supportsAudio === true ? { supportsAudio: true } : {}),
+      ...(model.supportsVideo === true ? { supportsVideo: true } : {}),
     };
   };
 
@@ -224,6 +230,9 @@ export async function importManagedModels({
       outputTokenLimit?: number;
       description?: string;
       supportsThinking?: boolean;
+      supportsVision?: boolean;
+      supportsAudio?: boolean;
+      supportsVideo?: boolean;
     }>,
     { allowEmpty: true }
   )) as JsonRecord[];

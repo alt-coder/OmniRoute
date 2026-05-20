@@ -1,5 +1,6 @@
 import type { CompressionResult, CompressionMode } from "./types.ts";
 import { createCompressionStats } from "./stats.ts";
+import { getResolvedModelCapabilities } from "@/lib/modelCapabilities.ts";
 
 interface Message {
   role: string;
@@ -53,14 +54,19 @@ function normalizeMessageWhitespace(content: string): string {
 }
 
 function modelSupportsVision(model: string): boolean {
-  const normalized = model.toLowerCase();
-  return (
-    normalized.includes("vision") ||
-    normalized.includes("gpt-4") ||
-    normalized.includes("4o") ||
-    normalized.includes("claude-3") ||
-    normalized.includes("gemini")
-  );
+  // Use the centralized model capabilities system instead of a hardcoded whitelist.
+  // Unknown models (supportsVision === null) are treated as vision-capable
+  // to avoid stripping images from models that genuinely support them.
+  try {
+    const capabilities = getResolvedModelCapabilities(model);
+    // null = unknown → assume vision-capable (don't strip images)
+    return capabilities.supportsVision !== false;
+  } catch {
+    // DB unavailable (test env, fresh process, etc.) → assume vision-capable
+    // to avoid breaking new providers. Previously a hardcoded whitelist
+    // missed kimi, deepseek-v4, glm-5, and all custom provider models.
+    return true;
+  }
 }
 
 export function collapseWhitespace(

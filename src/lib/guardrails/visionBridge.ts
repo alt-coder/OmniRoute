@@ -38,6 +38,16 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
     this.deps = options?.deps ?? {};
   }
 
+  private isCompatibleCustomProvider(providerId: string | null | undefined): boolean {
+    if (!providerId) return false;
+    return (
+      providerId.startsWith("openai-compatible-") ||
+      providerId.startsWith("anthropic-compatible-") ||
+      providerId === "openai-compatible" ||
+      providerId === "anthropic-compatible"
+    );
+  }
+
   async preCall(payload: unknown, context: GuardrailContext): Promise<GuardrailResult<unknown>> {
     // 1. Check if disabled at guardrail level
     if (!this.enabled) {
@@ -64,6 +74,26 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
       return { block: false };
     }
 
+    // 4b. Bypass for custom providers (OpenAI/Anthropic compatible).
+    // Pre-call guardrails run before the downstream route has fully resolved the
+    // provider, so prefer explicit context/provider resolution and fall back to
+    // the header when present.
+    const headerProviderId =
+      context.headers instanceof Headers
+        ? context.headers.get("x-omniroute-provider-id")
+        : (context.headers as Record<string, string> | null | undefined)?.[
+            "x-omniroute-provider-id"
+          ];
+    const providerId = context.provider || capabilities.provider || headerProviderId || "";
+    if (this.isCompatibleCustomProvider(providerId)) {
+      return { block: false };
+    }
+
+    // 4c. Fallback: If vision support is unknown (null) but not explicitly false, allow it.
+    if (capabilities.supportsVision === null) {
+      return { block: false };
+    }
+
     // 5. Get body and check for messages
     const body = payload as Record<string, unknown>;
     const messages = body?.messages;
@@ -71,7 +101,7 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
       return { block: false };
     }
 
-    // 6. Check for images using helper (extractImageParts returns empty if no images)
+    // 6. Check for images using helper
     const imageParts = extractImageParts(messages as Parameters<typeof extractImageParts>[0]);
     if (imageParts.length === 0) {
       return { block: false };

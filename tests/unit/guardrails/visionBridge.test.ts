@@ -198,6 +198,36 @@ test("VB-S02b: respects native vision support for GPT-family models", async () =
   }
 });
 
+test("VB-S02c: passthroughs for OpenAI-compatible custom providers before provider resolution", async () => {
+  const guardrail = createGuardrail();
+  const payload = createPayload({
+    model: "openai-compatible-chat-demo/kimi-k2.6-precision",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this image." },
+          {
+            type: "image_url",
+            image_url: {
+              url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ",
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  const result = await guardrail.preCall(
+    payload,
+    createContext({ model: "openai-compatible-chat-demo/kimi-k2.6-precision" })
+  );
+
+  assert.strictEqual(result.block, false);
+  assert.strictEqual(result.modifiedPayload, undefined);
+  assert.strictEqual(visionCallCount, 0);
+});
+
 test("VB-S02: model capabilities returns supportsVision for known models", () => {
   const gpt4oCaps = getResolvedModelCapabilities("openai/gpt-4o");
   // supportsVision may be true (if sync data exists) or null (if not synced)

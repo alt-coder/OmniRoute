@@ -75,6 +75,7 @@ export function claudeToOpenAIRequest(model, body, stream) {
     for (let i = 0; i < body.messages.length; i++) {
       const msg = body.messages[i];
       const converted = convertClaudeMessage(msg);
+
       if (converted) {
         // Handle array of messages (multiple tool results)
         if (Array.isArray(converted)) {
@@ -251,10 +252,7 @@ function convertClaudeMessage(msg) {
             resultContent = block.content;
           } else if (Array.isArray(block.content)) {
             resultContent =
-              block.content
-                .filter((c) => c.type === "text")
-                .map((c) => c.text)
-                .join("\n") || JSON.stringify(block.content);
+              block.content.map((c) => c?.text).join("\n") || JSON.stringify(block.content);
           } else if (block.content) {
             resultContent = JSON.stringify(block.content);
           }
@@ -287,6 +285,7 @@ function convertClaudeMessage(msg) {
       if (reasoningContent !== null) {
         result.reasoning_content = reasoningContent;
       }
+
       return result;
     }
 
@@ -299,6 +298,7 @@ function convertClaudeMessage(msg) {
       if (reasoningContent !== null && role === "assistant") {
         result.reasoning_content = reasoningContent;
       }
+
       return result;
     }
 
@@ -308,6 +308,7 @@ function convertClaudeMessage(msg) {
       if (reasoningContent !== null && role === "assistant") {
         result.reasoning_content = reasoningContent;
       }
+
       return result;
     }
 

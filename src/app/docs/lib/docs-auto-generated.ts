@@ -161,6 +161,11 @@ export const autoNavSections: AutoGenNavSection[] = [
         fileName: "frameworks/EVALS.md",
       },
       {
+        slug: "gamification",
+        title: "Gamification & Leaderboard System",
+        fileName: "frameworks/GAMIFICATION.md",
+      },
+      {
         slug: "mcp-server",
         title: "OmniRoute MCP Server Documentation",
         fileName: "frameworks/MCP-SERVER.md",
@@ -799,6 +804,26 @@ export const autoSearchIndex: AutoGenSearchItem[] = [
     ],
   },
   {
+    slug: "gamification",
+    title: "Gamification & Leaderboard System",
+    fileName: "frameworks/GAMIFICATION.md",
+    section: "Frameworks",
+    content:
+      "Source of truth: src/lib/gamification/, src/lib/db/gamification.ts, src/app/api/gamification/ Last updated: 2026-05-19 — v3.8.0 OmniRoute includes a local-first gamification layer that rewards users for engaging with the platform — making requests, switching providers, creating combos, sharing token",
+    headings: [
+      "Overview",
+      "Purpose",
+      "Scope",
+      "Design Principles",
+      "Architecture",
+      "High-Level Flow",
+      "Module Dependency Graph",
+      "Data Layer",
+      "Database Tables",
+      "Domain Module: src/lib/db/gamification.ts",
+    ],
+  },
+  {
     slug: "mcp-server",
     title: "OmniRoute MCP Server Documentation",
     fileName: "frameworks/MCP-SERVER.md",
@@ -1346,6 +1371,7 @@ export const autoAllSlugs: string[] = [
   "agent-protocols-guide",
   "cloud-agent",
   "evals",
+  "gamification",
   "mcp-server",
   "memory",
   "opencode",
