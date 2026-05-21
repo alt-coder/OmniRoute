@@ -272,10 +272,26 @@ export function enrichCatalogModelEntry<T extends JsonRecord>(
   if (!metadata) return entry;
 
   const nextEntry: JsonRecord = { ...entry };
-  const capabilityFields = {
+
+  // Infer vision from supported_endpoints containing "images" when metadata
+  // doesn't provide a definitive boolean. This covers custom models and
+  // synced API-discovered models that advertise image support via endpoints
+  // but aren't in models.dev / hardcoded registry.
+  const entryEndpoints = ((entry as JsonRecord).supported_endpoints ??
+    (entry as JsonRecord).supportedEndpoints ??
+    []) as string[];
+  const hasImageEndpoint =
+    Array.isArray(entryEndpoints) &&
+    entryEndpoints.some((ep: string) => String(ep).toLowerCase() === "images");
+  const fallbackVision =
+    hasImageEndpoint && typeof metadata.capabilities.vision !== "boolean" ? true : null;
+
+  const capabilityFields: Record<string, unknown> = {
     ...(typeof metadata.capabilities.vision === "boolean"
       ? { vision: metadata.capabilities.vision }
-      : {}),
+      : fallbackVision !== null
+        ? { vision: fallbackVision }
+        : {}),
     tool_calling: metadata.capabilities.toolCalling,
     reasoning: metadata.capabilities.reasoning,
     ...(typeof metadata.capabilities.supportsThinking === "boolean"

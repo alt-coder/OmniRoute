@@ -66,5 +66,26 @@ export async function POST(request) {
     console.error("[SECURITY] Prompt injection guard failed:", error);
   }
 
+  // ── Stream inference ──────────────────────────────────────────────
+  // Some providers (e.g. crof.ai) require explicit "stream":true in the
+  // body and won't infer it from Accept: text/event-stream alone. Bypass
+  // inference when the client explicitly sends stream:false or Accept
+  // application/json.
+  {
+    const cloned = request.clone();
+    const body = await cloned.json().catch(() => null);
+    if (body && typeof body === "object" && !Array.isArray(body) && body.stream === undefined) {
+      const accept = request.headers.get("accept") || "";
+      if (!accept.includes("application/json")) {
+        const modified = new Request(request.url, {
+          method: request.method,
+          headers: request.headers,
+          body: JSON.stringify({ ...body, stream: true }),
+        });
+        return await handleChat(modified);
+      }
+    }
+  }
+
   return await handleChat(request);
 }

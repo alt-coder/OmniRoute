@@ -3040,6 +3040,12 @@ export async function handleChatCore({
         translatedBody.model === modelToCall
           ? translatedBody
           : { ...translatedBody, model: modelToCall };
+      // Ensure stream flag is in the body when upstream should stream — some
+      // providers (e.g. crof.ai) require explicit stream:true in the body and
+      // do NOT infer it from Accept: text/event-stream alone.
+      if (upstreamStream && !bodyToSend.stream) {
+        bodyToSend = { ...bodyToSend, stream: true };
+      }
       const payloadRuleModel =
         typeof bodyToSend.model === "string" && bodyToSend.model.length > 0
           ? bodyToSend.model

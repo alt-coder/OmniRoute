@@ -421,6 +421,12 @@ export class DefaultExecutor extends BaseExecutor {
           withDefaults = withoutStreamOptions;
         }
       } else if (stream && targetFormat === "openai" && requestFormat !== "openai-responses") {
+        // Ensure stream:true in the body — some providers (e.g. crof.ai) do NOT
+        // infer streaming from Accept: text/event-stream alone; they require the
+        // explicit body field.
+        if (!(withDefaults as Record<string, unknown>).stream) {
+          withDefaults = { ...withDefaults, stream: true };
+        }
         if (!credentials?.providerSpecificData?.disableStreamOptions) {
           withDefaults = {
             ...withDefaults,

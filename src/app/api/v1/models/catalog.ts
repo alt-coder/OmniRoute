@@ -707,7 +707,16 @@ export async function getUnifiedModelsResponse(
           else if (endpoints.includes("rerank")) modelType = "rerank";
           else if (endpoints.includes("images")) modelType = "image";
           else if (endpoints.includes("audio")) modelType = "audio";
-          const syncedFields = {
+          // Pre-fill capabilities from provider discovery data (supportsVision etc.).
+          // These are preserved by enrichCatalogModelEntry (line 1122) which only
+          // overwrites capabilities when models.dev / registry supply a definitive
+          // boolean — for unknown models the discovery signals survive.
+          const discoverCaps: Record<string, boolean> = {};
+          if (sm.supportsVision) discoverCaps.vision = true;
+          if (sm.supportsThinking) discoverCaps.thinking = true;
+          if (sm.supportsAudio) discoverCaps.audio = true;
+          if (sm.supportsVideo) discoverCaps.video = true;
+          const syncedFields: Record<string, unknown> = {
             ...(modelType ? { type: modelType } : {}),
             ...(apiFormat !== "chat-completions" ? { api_format: apiFormat } : {}),
             ...(modelType === "audio" ? { subtype: "transcription" } : {}),
@@ -715,6 +724,7 @@ export async function getUnifiedModelsResponse(
             ...(endpoints.length > 1 || !endpoints.includes("chat")
               ? { supported_endpoints: endpoints }
               : {}),
+            ...(Object.keys(discoverCaps).length > 0 ? { capabilities: discoverCaps } : {}),
           };
 
           const existingAliasModel = models.find((model) => model.id === aliasId);
