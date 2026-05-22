@@ -266,6 +266,11 @@ export async function handleChat(request: any, clientRawRequest: any = null) {
       preCallGuardrails.message || "Request rejected: suspicious content detected"
     );
   }
+  // Preserve stream flag after guardrail processing — guardrails may strip
+  // non-message fields like stream from the payload.
+  if (body?.stream !== undefined && preCallGuardrails.payload?.stream === undefined) {
+    preCallGuardrails.payload = { ...preCallGuardrails.payload, stream: body.stream };
+  }
   body = preCallGuardrails.payload;
   telemetry.endPhase();
 

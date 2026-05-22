@@ -34,6 +34,9 @@ export function resolveStreamFlag(
   // Explicit body value always wins
   if (bodyStream === true) return true;
   if (bodyStream === false) return false;
+  // Handle string values that may slip through without Zod validation
+  if (bodyStream === "true") return true;
+  if (bodyStream === "false") return false;
 
   // Anthropic Messages API spec: stream defaults to false when body omits it.
   // Only honor an explicit text/event-stream Accept header as a streaming opt-in

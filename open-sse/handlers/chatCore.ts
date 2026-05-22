@@ -2454,7 +2454,9 @@ export async function handleChatCore({
     headers: clientRawRequest?.headers,
     userAgent,
   });
-  const upstreamStream = stream || isClaudeCodeCompatible;
+  // Respect explicit stream:false — don't force upstream streaming even for
+  // CC-compatible providers. Only fall back to CC override when stream is not set.
+  const upstreamStream = stream === false ? false : stream || isClaudeCodeCompatible;
   let ccSessionId: string | null = null;
   const stripTypes = getStripTypesForProviderModel(provider || "", model || "");
 
