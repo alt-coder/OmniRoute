@@ -14,6 +14,7 @@ const DEFAULT_LIMITS: Record<string, number> = {
   openai: 128000,
   gemini: 1000000,
   codex: 400000,
+  deepseek: 1000000,
   default: 128000,
 };
 

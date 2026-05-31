@@ -140,10 +140,12 @@ export async function registerNodejs(): Promise<void> {
       { migrateCodexConnectionDefaultsFromLegacySettings },
       { startSessionAccountAffinityCleanup },
       { seedDefaultModelAliases },
+      { prewarmAllSpecCaches },
     ] = await Promise.all([
       import("@/lib/providers/codexConnectionDefaults"),
       import("@/lib/db/sessionAccountAffinity"),
       import("@/lib/modelAliasSeed"),
+      import("@/lib/providerModelFetcher"),
     ]);
     let settings = await getSettings();
     const passwordState = await ensurePersistentManagementPasswordHash({
@@ -166,6 +168,16 @@ export async function registerNodejs(): Promise<void> {
       `[STARTUP] Model alias seed: applied=${seededModelAliases.applied.length}, skipped=${seededModelAliases.skipped.length}, failed=${seededModelAliases.failed.length}`
     );
     startSessionAccountAffinityCleanup();
+
+    // Pre-warm provider model spec caches in background (non-blocking)
+    prewarmAllSpecCaches()
+      .then(() => {
+        console.log("[STARTUP] Provider model spec caches pre-warmed");
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn("[STARTUP] Provider model spec cache pre-warm failed:", msg);
+      });
 
     const migration = await migrateCodexConnectionDefaultsFromLegacySettings();
     if (migration.migrated) {

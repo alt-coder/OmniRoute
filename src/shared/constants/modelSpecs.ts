@@ -186,6 +186,20 @@ export const MODEL_SPECS: Record<string, ModelSpec> = {
     supportsTools: true,
   },
 
+  // ── DeepSeek V4 ──────────────────────────────────────────────────
+  "deepseek-v4-pro": {
+    maxOutputTokens: 384000,
+    contextWindow: 1000000,
+    supportsThinking: true,
+    supportsTools: true,
+  },
+  "deepseek-v4-flash": {
+    maxOutputTokens: 384000,
+    contextWindow: 1000000,
+    supportsThinking: true,
+    supportsTools: true,
+  },
+
   // Defaults
   __default__: {
     maxOutputTokens: 8192,

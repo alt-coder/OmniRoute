@@ -107,6 +107,8 @@ export interface RegistryEntry {
   passthroughModels?: boolean;
   /** Default context window for all models in this provider (can be overridden per-model) */
   defaultContextLength?: number;
+  /** Default max output tokens for all models in this provider (can be overridden per-model) */
+  defaultMaxOutputTokens?: number;
 }
 
 interface LegacyProvider {
@@ -1939,9 +1941,23 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     baseUrl: "https://api.deepseek.com/v1/chat/completions",
     authType: "apikey",
     authHeader: "bearer",
+    defaultContextLength: 1000000,
+    defaultMaxOutputTokens: 384000,
     models: [
-      { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", supportsReasoning: true },
-      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", supportsReasoning: true },
+      {
+        id: "deepseek-v4-pro",
+        name: "DeepSeek V4 Pro",
+        contextLength: 1000000,
+        maxOutputTokens: 384000,
+        supportsReasoning: true,
+      },
+      {
+        id: "deepseek-v4-flash",
+        name: "DeepSeek V4 Flash",
+        contextLength: 1000000,
+        maxOutputTokens: 384000,
+        supportsReasoning: true,
+      },
     ],
   },
 

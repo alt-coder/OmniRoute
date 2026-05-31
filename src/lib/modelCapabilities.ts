@@ -2,11 +2,13 @@ import {
   PROVIDER_ID_TO_ALIAS,
   PROVIDER_MODELS,
 } from "@omniroute/open-sse/config/providerModels.ts";
+import { REGISTRY } from "@omniroute/open-sse/config/providerRegistry.ts";
 import { parseModel, resolveCanonicalProviderModel } from "@omniroute/open-sse/services/model.ts";
 import { MODEL_SPECS, getModelSpec, type ModelSpec } from "@/shared/constants/modelSpecs";
 import { getSyncedCapability } from "@/lib/modelsDevSync";
 import { getCustomModels, getSyncedAvailableModels } from "@/lib/db/models";
 import { getDbInstance } from "@/lib/db/core";
+import { getCachedModelSpec, getCachedProviderSpec } from "@/lib/providerModelFetcher";
 
 const TOOL_CALLING_UNSUPPORTED_PATTERNS: string[] = [];
 const REASONING_UNSUPPORTED_PATTERNS = [
@@ -271,9 +273,21 @@ export function getResolvedModelCapabilities(input: CapabilityInput): ResolvedMo
         : null) ??
       (typeof spec?.supportsThinking === "boolean" ? spec.supportsThinking : null));
 
+  const providerEntry = resolved.provider ? REGISTRY[resolved.provider] : null;
+  const providerDefaultContextLength = providerEntry?.defaultContextLength ?? null;
+  const providerDefaultMaxOutputTokens = providerEntry?.defaultMaxOutputTokens ?? null;
+
+  // Check cached provider API specs (from models endpoint)
+  const cachedProviderSpec =
+    (resolved.provider && resolved.model
+      ? getCachedModelSpec(resolved.provider, resolved.model)
+      : null) ?? (resolved.provider ? getCachedProviderSpec(resolved.provider) : null);
+
   const contextWindow =
     synced?.limit_context ??
     (typeof registryModel?.contextLength === "number" ? registryModel.contextLength : null) ??
+    providerDefaultContextLength ??
+    cachedProviderSpec?.contextLength ??
     spec?.contextWindow ??
     null;
 
@@ -304,6 +318,8 @@ export function getResolvedModelCapabilities(input: CapabilityInput): ResolvedMo
       (typeof (registryModel as any)?.outputTokenLimit === "number"
         ? (registryModel as any).outputTokenLimit
         : null) ??
+      providerDefaultMaxOutputTokens ??
+      cachedProviderSpec?.maxOutputTokens ??
       spec?.maxOutputTokens ??
       MODEL_SPECS.__default__.maxOutputTokens,
     defaultThinkingBudget: spec?.defaultThinkingBudget ?? 0,
